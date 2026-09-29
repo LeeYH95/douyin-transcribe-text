@@ -952,6 +952,9 @@ def transcribe_local(video_path: Path,
         raise DouyinError("转写结果为空，请检查视频是否包含清晰口播")
     (dest_dir / "transcript_raw.md").write_text(raw_text, encoding="utf-8")
 
+    # SenseVoice 非语音音频标记（背景音乐/BGM）→ 直接删，不进知识库
+    # transcript_raw.md 保留纯净原文；清理只发生在 corrected 及之后的链路
+    raw_text = raw_text.replace("\U0001f3b4", "")  # 🎼 U+1F3B4
     corrected = correct_proper_nouns(raw_text)
     suspects = find_suspect_terms(corrected)
     repeats = find_repeats(corrected)
@@ -989,9 +992,9 @@ def transcribe_local(video_path: Path,
         "ok": True,
         "video_id": video_id,
         "title": title,
-        "raw_text": raw_text,
+        "raw_text": raw_text,  # 仍含 🎼（transcript_raw.md 保持原样）
         "corrected_text": corrected,
-        "display_text": display,
+        "display_text": display,  # 已清除 🎼
         "suspect_terms": suspects,
         "repeats": repeats,
         "video_path": str(video_path),
