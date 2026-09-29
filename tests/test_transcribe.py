@@ -466,3 +466,106 @@ class TestFetchStream:
             cands = [("http://example.com/fail_fixture", 1000)]
             with pytest.raises(t.DouyinError, match="所有 CDN 候选流均下载或解析失败"):
                 t._fetch_stream(cands, Path("/tmp"), "http://ref")
+
+
+# =============================================================================
+# 疑词截帧验证（verify_terms.py）
+# =============================================================================
+
+import importlib.util as _ilu
+
+_VT = Path(__file__).parent.parent / "scripts" / "verify_terms.py"
+_vspec = _ilu.spec_from_file_location("verify_terms", _VT)
+vt = _ilu.module_from_spec(_vspec)
+_vspec.loader.exec_module(vt)
+
+
+class TestVerifyTermsMapping:
+    """时间轴映射 + 密集采样 + 命名。"""
+
+    TEXT = "前面的铺垫内容" * 20 + "目标疑词" + "后面的收尾内容" * 20
+
+    def test_按字符位置估算时间(self):
+        plan = vt.estimate_times(["目标疑词"], self.TEXT, 100.0, window=0, step=999)
+        ts = plan["目标疑词"]
+        assert len(ts) == 1
+        # 目标词在正中间 → 约 50s
+        assert 45 < ts[0] < 55
+
+    def test_密集采样覆盖窗口(self):
+        """实测单点抽帧会落空 7s，必须 ±window 密集采。"""
+        plan = vt.estimate_times(["目标疑词"], self.TEXT, 100.0, window=12, step=2)
+        ts = plan["目标疑词"]
+        assert len(ts) > 10, "采样点太少，仍会落空"
+        assert min(ts) < 50 < max(ts), "采样窗口未覆盖估算点"
+
+    def test_采样不越界(self):
+        plan = vt.estimate_times(["目标疑词"], "目标疑词", 10.0, window=12, step=2)
+        assert min(plan["目标疑词"]) >= 0
+        assert max(plan["目标疑词"]) <= 10.0
+
+    def test_词不在文本中_仍给采样点(self):
+        """查不到的词也要给候选帧，否则直接漏检。"""
+        plan = vt.estimate_times(["不存在的词"], self.TEXT, 100.0, window=2, step=2)
+        assert len(plan["不存在的词"]) >= 1
+
+    def test_slugify_保留中文(self):
+        assert vt.slugify("申屠电网") == "申屠电网"
+
+    def test_slugify_处理空格与符号(self):
+        assert vt.slugify("n twogaM") == "n_twogaM"
+        assert vt.slugify("work-body!") == "work_body"
+
+    def test_slugify_空词兜底(self):
+        assert vt.slugify("!!!") == "term"
+
+
+class TestVerifyTermsFFmpeg:
+    """真跑 ffmpeg，验产物结构。"""
+
+    @pytest.fixture
+    def video(self, tmp_path):
+        v = tmp_path / "v.mp4"
+        # -color_range pc 必加：ffmpeg 8.x 的 mjpeg 编码器拒绝
+        # non-full-range YUV（"Non full-range YUV is non-standard"），
+        # 缺这行则连不加工具滤镜都存不出 jpg。已实测验证。
+        r = __import__("subprocess").run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "testsrc=duration=3:size=320x240:rate=5",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-color_range", "pc", "-y", str(v)],
+            capture_output=True)
+        if r.returncode != 0:
+            pytest.skip("ffmpeg 不可用")
+        return v
+
+    def test_产出全帧与字幕条(self, video, tmp_path):
+        out = tmp_path / "frames"
+        got = vt.grab(video, 1.0, out, "测试", 320, 240)
+        assert len(got) == 2
+        full, sub = got
+        assert full.exists() and sub.exists()
+        assert full.name == "测试_1.jpg"
+        assert sub.name == "测试_1_sub.jpg"
+        assert full.stat().st_size > 0 and sub.stat().st_size > 0
+
+    def test_字幕条为底部裁剪(self, video, tmp_path):
+        """字幕条是「宽而扁」的横带，不是全帧。
+
+        注意：裁剪后又被 scale 拉到 720 宽，高度会按比例放大
+        （320x52 → 720x117），所以不能断言绝对高度，
+        只能断言宽高比显著小于原视频。
+        """
+        out = tmp_path / "frames"
+        _, sub = vt.grab(video, 1.0, out, "t", 320, 240)
+        w, h = vt.probe_size(sub)
+        assert w == 720, "字幕条未缩放到 720 宽"
+        assert h / w < 0.3, f"字幕条不是横带（{w}x{h}）"
+        # 原视频 240/320 = 0.75，裁剪后应降到 1/3 以下
+        assert h / w < 240 / 320 / 2
+
+    def test_探测时长与尺寸(self, video):
+        dur = vt.probe_duration(video)
+        w, h = vt.probe_size(video)
+        assert 2.5 < dur < 3.5
+        assert (w, h) == (320, 240)

@@ -47,6 +47,7 @@ python3 $T --video in.mp4 --frames 68,231,253,285   # 疑词截帧验证
   transcribe()                  硅基流动 SenseVoice（失败降级本地 Whisper）
   correct_proper_nouns()        已知专有名词批量替换（纯本地）
   find_suspect_terms()          标记仍存疑的词
+  verify_terms.py               疑词截帧验证（必跑，见 references/frame-verification.md）
   format_output()               YAML frontmatter + 一级标题分段
                     │
                     ▼
@@ -136,6 +137,25 @@ python3 -m venv ~/.agents/venvs/whisper
 
 **新增词条必须走截帧验证，不能凭上下文猜。** 校正优先看**视频烧录字幕**（比用量表帧更直接），方法见 `--frames`。
 
+## 疑词截帧验证（必跑，不可跳过）
+
+**交付前必须核实每一个疑词**，输出「已核实 / 仍未核实」两张表。只列「待确认」就交付 = 未完成。
+
+完整流程见 `references/frame-verification.md`。三条硬规则：
+
+| 规则 | 说明 |
+|------|------|
+| **密集采样，不准单点抽帧** | 按 `字符位置/总长×时长` 估算误差实测达 **7s**（🎼音乐段+停顿打乱语速）。`verify_terms.py` 默认在估算点 **±12s、步长 2s** 抽帧 |
+| **禁用「画面里有什么」类提问** | VLM 实测会**编造画面不存在的内容**（把 `a16z` 凑成一篇《教父》影评）。必须用严格 OCR 提示：「只逐字抄录底部字幕，不要描述画面」 |
+| **字幕 + UI 双证据才算定案** | 单一来源不采信。屏幕录制类视频（横屏）**UI 文字是最强证据源**，优先读全帧而非只抠字幕条 |
+
+```bash
+python3 ~/.agents/skills/douyin-transcribe-text/scripts/verify_terms.py \
+  --video <mp4> --text <transcript_raw.md> --terms "词1,词2" --out <frames_dir>
+```
+
+**为什么不能只靠上下文推断：** 2026-09-29 实测 7 个疑词里推断错 2 个（`n twogaM`→Notion 实为 **NotebookLM**；`重庆HD`→Claude HD 实为 **ChatGPT**），错误率 29%。这些词看起来全都"能从上下文推出来"，**自查发现不了**，只能靠画面定案。
+
 ## 踩坑记录
 
 1. **抖音不自动播放** —— 必须 `play()` / 空格键触发，否则拦截到 0 条流
@@ -208,6 +228,7 @@ speaker: 演讲者
 3. **视频保留本地** —— `~/Downloads/douyin_videos/<video_id>/`
 4. **存疑必标注** ⚠️ —— 无法核实的词保留原文并注明
 5. **来源不编造** —— 没有原始转发文本就注明未提供
+6. **疑词必核** —— 交付前跑 `verify_terms.py`，输出「已核实 / 仍未核实」两张表。只列待确认就交付 = 未完成
 
 ## 测试
 
