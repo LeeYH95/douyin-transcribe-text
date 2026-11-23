@@ -1,6 +1,10 @@
 # 疑词截帧验证流程
 
-> 2026-09-29 建立。当天实测：7 个待确认词里 **2 个推断是错的**（Notion→实为 NotebookLM，Claude HD→实为 ChatGPT），错误率 29%。
+> **读这里的条件**：逐字稿已生成，`find_suspect_terms()` 报了疑词，需要核实。
+> 读帧本身怎么读（串行、严格 OCR 提示、整帧 vs 字幕条、本地 Vision OCR、帧拷进工作区）
+> 见 `references/frame-reading.md` —— 那是所有读帧任务通用的规矩，读一次就够。
+
+---
 
 ## 为什么这一步不能跳
 
@@ -11,64 +15,65 @@
 | `n twogaM` | Notion | `NotebookLM (EXPERIMENTAL)` | **推断错** |
 | `重庆HD` | Claude HD | `然后现在从ChatGPT和Codex的` | **推断错** |
 | `申屠电网` | 无法判断 | 字幕`深度调研`+UI 面板标题 | 推断不出 |
-| `深度洞裁` | 深度洞察 | `一个深度洞察的结果` | 对 |
-| `外coing` | vibecoding | `带你从0到1学习AI和Vibe Coding` | 对（大小写有差） |
+| 深度洞裁 | 深度洞察 | `一个深度洞察的结果` | 对 |
+| 外coing | vibecoding | `带你从0到1学习AI和Vibe Coding` | 对（大小写有差） |
 
 **铁律：交付前必须跑截帧验证，输出「已核实 / 仍未核实」两张表。不允许只列待确认就交付。**
 
-## 三个踩过的坑
+---
 
-### 1. 时间轴映射不准，必须密集采样
+## 根因：滚动会让 Playwright 拦截到推荐视频的 CDN 流
 
-按 `字符位置 / 总长 × 时长` 估算，**实测 3 帧落空 2 帧**（57s 估到实况 64s，偏差 7s）。
+`capture_stream_urls` 曾经有「向下滚动 3 次」的逻辑（用于触发更多内容加载）。实测 2026-10-01 发现：
 
-原因：口播视频里有 `🎼` 音乐段、停顿、语速变化，字符位置和真实时间不成正比。
+> 抖音单视频页往下滚 → 页面**预载推荐视频流** → 滚动期间的 CDN 拦截请求属于推荐视频，**不是目标视频**
 
-→ `verify_terms.py` 默认在估算点 **±12s 内、步长 2s 密集采样**，每个词 13 帧。宁可多抽，不可漏抽。
+后果：下载到的媒体是推荐视频（比如天安门升旗），目标视频内容完全丢失。
 
-### 2. VLM 会编造画面里没有的东西
+**修复**：删除所有滚动逻辑，只触发目标视频播放。不滚动 = 不引入推荐视频 CDN 污染。
 
-实测对 215s 帧提问「画面里有什么」，VLM 返回**一整篇《教父》电影分析**——画面里根本没有。它把提示词里的 `a16z` 当成了线索硬凑。
+如果截帧验证时发现时间轴完全错位（抽的帧内容和疑词上下文不匹配），优先怀疑下载到的不是目标视频，而非时间轴估算误差。
 
-同一次调用里，只有三处可信：左上角 logo、UI 元素、底部字幕。
+---
 
-→ **禁止问「画面里有什么 / 请描述 / 帮我总结」。** 必须用严格 OCR 提示：
+## 两条核实硬规则
 
-```
-只逐字抄录底部黑色字幕条的文字，不要描述画面，不要补充画面以外的内容。
-```
+| 规则 | 说明 |
+|------|------|
+| **密集采样，不准单点抽帧** | 按 `字符位置/总长×时长` 估算，误差实测达 **7s**（🎼音乐段+停顿打乱语速）。`verify_terms.py` 默认在估算点 **±12s、步长 1s** 抽帧 |
+| **字幕 + UI 双证据才算定案** | 单一来源不采信。屏幕录制类视频（横屏）**UI 文字是最强证据源**，优先读全帧而非只抠字幕条 |
 
-→ 交叉验证：**字幕 + UI 元素同时读到才算定案**，单一来源不采信。
+「怎么读帧」的具体做法（禁问「画面里有什么」、严格 OCR 提示、串行、Vision OCR、路径白名单）
+→ **`references/frame-reading.md`**
 
-### 3. 屏幕录制类视频，UI 文字是最强证据源
-
-Codex 教程是 1280x720 横屏屏幕录制，画面上就是软件界面。界面上直接写着 `NotebookLM (EXPERIMENTAL)`、`创建项目`、`Vibe Coding`——**比任何上下文推断都可靠**。
-
-→ 视频是横屏 / 疑似录屏时，优先读全帧的 UI 文字，不要只抠字幕条。
+---
 
 ## 怎么跑
 
 ```bash
-T=~/.agents/skills/douyin-transcribe-text/scripts/verify_terms.py
-V=~/Downloads/douyin_videos/<video_id>/<video_id>.mp4
-R=~/Downloads/douyin_videos/<video_id>/transcript_raw.md
+T="<douyin-transcribe-text-skill-dir>/scripts/verify_terms.py"
+D="<媒体根目录>/抖音/<主题>_<作者>_<日期>"
 
-python3 $T --video "$V" --text "$R" \
+python3 $T --video "$D/<video_id>.mp4" --text "$D/transcript_raw.md" \
   --terms "申屠电网,n twogaM,重庆HD" \
-  --out ~/Downloads/douyin_videos/<video_id>/frames
+  --out "$D/frames"
 ```
+
+> 目录名用 `<主题>_<作者>_<日期>`（见 README《媒体落盘位置》），视频文件名仍是 `<video_id>.mp4`。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--window` | 12 | 估算点 ±N 秒 |
-| `--step` | 2 | 采样步长 |
+| `--step` | **1** | 采样步长秒；设为 2 会漏掉比 2 秒短的字幕（如片尾短句） |
 | `--times` | — | 直接给秒数，跳过估算（已知位置时用） |
 
 每个词产出两份：
 - `词_秒.jpg` — 全帧，读 UI 用
-- `词_秒_sub.jpg` — 底部字幕条，读字幕用（`view_image` **不认 /tmp**，需拷到工作区）
+- `词_秒_sub.jpg` — 底部字幕条，读字幕用（需拷到工作区才能 `view_image`）
 
 产物同时写 `manifest.json`（疑词 → 帧列表）。
+
+---
 
 ## 交付格式
 
@@ -86,8 +91,48 @@ python3 $T --video "$V" --text "$R" \
 
 **没验完也要说**，不能默默交付。这和「待确认」列表不是一回事——待确认是我没查，仍未核实是我查了但没查到。
 
+---
+
+## 录屏/幻灯片类视频：没有烧录字幕 ≠ 无法核实
+
+**无烧录字幕的视频不能直接跳过核实** —— 画面上的幻灯片/UI 文字就是证据。
+实测 2026-10-30 的 RAG 录屏（1280x720，1429s）：无烧录字幕，但按幻灯片切换点
+采样 OCR 后，能读出「切片→向量检索」「语义切分」等幻灯片文字，疑词校正就锚在
+这些帧上。
+
+### 步骤 1：找幻灯片切换点（帧差分）
+
+`ffmpeg → pipe → 16x16 灰度 raw → 帧间像素差`。切换点的帧差远大于静止段，
+用「中位帧差 × 2.5」作阈值（实测中位 0.40 → 阈值 1.00，1429s 视频切出 84 个切换点）：
+
+```bash
+ffmpeg -v error -i "$V" -vf "fps=1,scale=16:16,format=gray" -f rawvideo - | python3 -c "
+import sys, statistics
+d = sys.stdin.buffer.read(); n = 256
+fr = [d[i:i+n] for i in range(0, len(d)-n+1, n)]
+df = [sum(abs(x-y) for x, y in zip(fr[i-1], fr[i]))/n for i in range(1, len(fr))]
+thr = max(statistics.median(df)*2.5, 3.0)
+print('切换秒点:', [i+1 for i, v in enumerate(df) if v > thr])
+"
+```
+
+### 步骤 2：串行 OCR 建文本索引
+
+用本地 Vision OCR（`scripts/ocr_vision.swift`），一次传多张即可，它内部逐张处理
+（并发会静默返回空结果，见 `references/frame-reading.md`）：
+
+```bash
+swiftc -O "<douyin-transcribe-text-skill-dir>/scripts/ocr_vision.swift" -o /tmp/ocr_vision
+/tmp/ocr_vision <frame_*.jpg> > /tmp/slide_text.txt
+```
+
+拿到文本索引后，逐词在索引里比对 —— 命中即证据，等价于烧录字幕的核实。
+
+---
+
 ## 何时可以跳过
 
-只有一种情况：视频**无烧录字幕且无 UI 文字**（纯真人口播、无任何屏幕文字）。此时抽帧无信息量，直接标注「本片无画面文字可核实」。
+只有一种情况：视频**既无烧录字幕、画面也无任何可读文字**（纯真人口播）。
+此时抽帧无信息量，标注「本片无画面文字可核实」。
 
-其余一律必跑。
+其余一律必跑 —— 包括「无烧录字幕」的录屏类视频（走上面的幻灯片 OCR 路线）。

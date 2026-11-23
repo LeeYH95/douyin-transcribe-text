@@ -6,12 +6,16 @@ douyin-transcribe-text 单元测试。
 全部离线，不触网、不调用转写 API。
 
 运行：
-    python3 -m pytest ~/.agents/skills/douyin-transcribe-text/tests/ -v
+    python3 -m pytest <douyin-transcribe-text-skill-dir>/tests/ -v
 """
 
 import importlib.util
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -300,11 +304,18 @@ class TestLinkParsing:
 
 class TestArchitecture:
     def test_单文件自包含(self):
-        """不得再有跨目录 import —— 这是本次合并的核心目标。"""
+        """不得跨 Skill 依赖 —— 本 skill 必须能独立跑。
+
+        同目录兄弟模块（naming.py）不算跨 Skill 依赖：它就在本 skill 内。
+        """
         src = SCRIPT.read_text(encoding="utf-8")
-        assert "sys.path.insert" not in src
         assert "from ingest" not in src
         assert "import ingest" not in src
+        # sys.path 只能指向本脚本所在目录（兄弟模块），不能指向别的 Skill
+        for line in src.splitlines():
+            if "sys.path.insert" in line:
+                assert "Path(__file__).parent" in line, \
+                    f"sys.path.insert 指向了非本目录：{line.strip()}"
 
     def test_无yt_dlp调用(self):
         """yt-dlp 路径已死，代码中不得残留实际调用。"""
@@ -382,6 +393,39 @@ FIXTURE_VIDEO = Path("/tmp/test_video_only.mp4")
 FIXTURE_COMBO = Path("/tmp/test_combined.mp4")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _media_fixtures():
+    """现场生成三个媒体样本（纯音频 / 纯视频 / 音视频合一）。
+
+    以前靠 /tmp 里预先存在的副本，换台机器就整组测试失效。
+    这里用 ffmpeg 现场生成：离线、可复现。
+    """
+    d = Path(tempfile.mkdtemp(prefix="dy_fixtures_"))
+    audio, video, combo = (d / "audio_only.m4a", d / "video_only.mp4",
+                           d / "combined.mp4")
+
+    def ff(*args):
+        r = subprocess.run(["ffmpeg", "-v", "error", *args],
+                           capture_output=True)
+        if r.returncode != 0:
+            pytest.skip(f"ffmpeg 不可用：{r.stderr.decode()[:120]}")
+
+    ff("-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "1",
+       "-c:a", "aac", "-f", "mp4", "-y", str(audio))
+    ff("-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=10",
+       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_range", "pc",
+       "-an", "-y", str(video))
+    ff("-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=10",
+       "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "1",
+       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_range", "pc",
+       "-c:a", "aac", "-shortest", "-y", str(combo))
+
+    global FIXTURE_AUDIO, FIXTURE_VIDEO, FIXTURE_COMBO
+    FIXTURE_AUDIO, FIXTURE_VIDEO, FIXTURE_COMBO = audio, video, combo
+    yield
+    shutil.rmtree(d, ignore_errors=True)
+
+
 class TestProbeStreams:
     """_probe_streams(path) → (has_video, has_audio)。"""
 
@@ -411,13 +455,10 @@ from unittest import mock
 def _mock_download(url: str, dest: Path, referer: str) -> Path:
     """根据 URL 里含的标记返回对应的 fixture 文件（不实际下载）。"""
     if "audio_fixture" in url:
-        import shutil
         shutil.copy(FIXTURE_AUDIO, dest)
     elif "video_fixture" in url:
-        import shutil
         shutil.copy(FIXTURE_VIDEO, dest)
     elif "combo_fixture" in url:
-        import shutil
         shutil.copy(FIXTURE_COMBO, dest)
     else:
         raise t.DouyinError(f"未知 URL: {url}")
@@ -569,3 +610,141 @@ class TestVerifyTermsFFmpeg:
         w, h = vt.probe_size(video)
         assert 2.5 < dur < 3.5
         assert (w, h) == (320, 240)
+
+
+# =============================================================================
+# 字幕带几何（2026-10-30 修复：横向不再裁切）
+# =============================================================================
+
+class TestSubtitleBandGeometry:
+    """字幕带必须覆盖**整幅画面宽度**。
+
+    中文烧录字幕水平居中，横向裁左边会把字幕右半截切掉：
+    实测 1280 宽视频上「就是把资料一股脑丢给AI」被裁成「就是把资料一股月」。
+    纵向安全边必须按画面高度取比例 —— 固定 150px 在矮视频上会吃掉整帧。
+    """
+
+    def test_安全边按比例而非固定像素(self):
+        assert not hasattr(vt, "SUB_SAFE"), "固定像素安全边已废弃"
+        assert vt.SUB_SAFE_RATIO > 0
+
+    @pytest.mark.parametrize("w,h", [(1080, 1920), (1280, 720), (320, 240)])
+    def test_字幕带占画高约三成且不超整帧(self, w, h):
+        band = int(h * vt.SUB_RATIO) + int(h * vt.SUB_SAFE_RATIO)
+        assert band < h, "字幕带不能等于整帧"
+        assert 0.25 <= band / h <= 0.35, f"字幕带占比异常：{band / h:.2f}"
+
+    def test_横向不裁切(self, tmp_path):
+        """裁剪参数里不能有横向 crop 起点 —— 必须整幅缩放。"""
+        video = tmp_path / "wide.mp4"
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "testsrc=duration=1:size=1280x720:rate=5",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_range", "pc",
+             "-y", str(video)], capture_output=True)
+        if r.returncode != 0:
+            pytest.skip("ffmpeg 不可用")
+        _, sub = vt.grab(video, 0.5, tmp_path / "f", "g", 1280, 720)
+        sw, sh = vt.probe_size(sub)
+        # 整幅 1280 宽缩到 720 → 高度按比例，不做横向裁剪
+        assert sw == 720
+        expected_h = round((int(720 * vt.SUB_RATIO)
+                            + int(720 * vt.SUB_SAFE_RATIO)) * 720 / 1280)
+        assert abs(sh - expected_h) <= 2, f"字幕带高度异常 {sh} != {expected_h}"
+
+
+# =============================================================================
+# 无口播判定（纯 BGM 视频的 ASR 输出是幻觉碎片）
+# =============================================================================
+
+class TestSpeechRate:
+    """speech_rate() 用「有效字符/秒」区分真人口播和纯 BGM。
+
+    实测 11 个真实抖音视频：无人声 0.03–0.47 字/秒，有人声 4.55–8.11 字/秒。
+    """
+
+    def test_真人说话不算无口播(self):
+        # 用实测口播样本的比例（约 5 字/秒）：33 字 ≈ 6.6s
+        _, rate, no_speech = t.speech_rate(
+            "兄弟们，贾维斯2.0已经正式上线了，我已经融入了我的生活当中。", 6.6)
+        assert rate > t.NO_SPEECH_RATE
+        assert no_speech is False
+
+    def test_真人说话按实测全文比例(self):
+        """实测样本（真实转写全文，336 有效字 / 73.7s = 4.56 字/秒 → 有人声）。
+
+        用完整转写而非片段：片段长度配全长时长会把语速算低，
+        让人声样本误判成无口播。
+        """
+        text = (
+            "兄弟们，贾维斯2.0已经正式上线，他已经融入到我的生活当中了。"
+            "我明天想去一下大唐不夜城，帮我导个航吧，我想看看堵不堵车。"
+            "From Park QR performance about 38 minutes by car, roughly 20.6 km, "
+            "arriving at 21432 looks reasonable just now, The route and the QR "
+            "code for fun navigation are on your screen Sir我.我家有多少个你能"
+            "控制的设备，请帮我打开阳台晾架的灯光。真的现在已经融入到我的生活"
+            "当中了。我知道多智能。贾维不断定制的东西。虽然我现在用的是投影仪，"
+            "但是我相信。全击特影来的那一天，他就是真正的家。宝马晾衣架灯光关了"
+            "吧。The drawing rack light is off now, Sir.Goodod nightイズベス."
+        )
+        eff, rate, no_speech = t.speech_rate(text, 73.7)
+        assert eff > 300, f"样本应接近真实全文 336 字，实际 {eff}"
+        assert rate > t.NO_SPEECH_RATE
+        assert no_speech is False
+
+    def test_纯BGM判为无口播(self):
+        _, rate, no_speech = t.speech_rate("Yeah.失实的。.", 15.0)
+        assert rate < t.NO_SPEECH_RATE
+        assert no_speech is True
+
+    def test_音乐标记不计入有效字符(self):
+        a = t.speech_rate("🎼。 🎼。.🎼。。", 210.0)
+        b = t.speech_rate("。 。.。。", 210.0)
+        assert a[0] == b[0], "🎼 不应计入有效字符"
+
+    def test_过短片段不判定(self):
+        """几秒的片段字数天然少，不能据此报「无口播」。"""
+        _, _, no_speech = t.speech_rate("大家好", 3.0)
+        assert no_speech is False
+
+    def test_阈值有余量(self):
+        """阈值要落在两组实测数据的中间，两侧都有余量。"""
+        assert t.NO_SPEECH_RATE > 0.5      # 高于无人声组最大值 0.47
+        assert t.NO_SPEECH_RATE < 4.0      # 低于有人声组最小值 4.55
+
+
+# =============================================================================
+# 标题取值规则（2026-10-30 修复：页面身份校验失败时不得采信 page_title）
+# =============================================================================
+
+class TestResolveTitle:
+    """页面身份校验失败时，page_title 属于**另一个**视频，不能用。
+
+    实测：抖音渲染成「jingxuan」页时，page_title 是
+    「天地之大 困住你的是什么」，而实际下载的是
+    「给自己的网站下了一场大雨」—— 标题对不上比标题难看更糟。
+    """
+
+    def test_显式标题最优先(self):
+        assert t.resolve_title("我传的标题", auto_title="推导标题",
+                               page_title="页面标题", video_id="123") == "我传的标题"
+
+    def test_页面推导标题次之(self):
+        assert t.resolve_title(auto_title="推导标题", page_title="页面标题",
+                               video_id="123") == "推导标题"
+
+    def test_身份正常时用页面标题并去掉话题标签(self):
+        got = t.resolve_title(page_title="用html做PPT #vibecoding #AI教程",
+                              page_identity_ok=True, video_id="123")
+        assert got == "用html做PPT"
+
+    def test_身份校验失败时不用页面标题(self):
+        got = t.resolve_title(page_title="天地之大 困住你的是什么",
+                              page_identity_ok=False, video_id="7700647620745735759")
+        assert got == "7700647620745735759", "身份校验失败时只能退回 video_id"
+        assert "天地之大" not in got
+
+    def test_身份失败时显式标题仍然优先(self):
+        got = t.resolve_title(explicit="我传的", page_title="别人的标题",
+                              page_identity_ok=False, video_id="123")
+        assert got == "我传的"

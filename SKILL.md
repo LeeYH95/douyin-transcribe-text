@@ -1,6 +1,6 @@
 ---
 name: douyin-transcribe-text
-description: 抖音视频下载 + 语音转写 + 专有名词校正 + 结构化输出。当用户发来抖音链接，需要提取口播逐字稿并整理成 Obsidian 格式时使用。完整流程：Playwright 浏览器渲染 → 网络拦截捕获 CDN 直链 → 下载 → ffmpeg 合成 → 音频转写 → 专有名词校正（疑词截帧验证）→ 分段输出。输出需发用户确认后才写入 Vault。
+description: 抖音视频 → 口播逐字稿 → Obsidian 结构化笔记。当用户发来抖音链接或本地 MP4，需要口播逐字稿、专有名词校正、疑词核实、分段整理，或需要把视频文件交付飞书时使用。只做口播逐字稿；画面里的 AI 生图提示词走 douyin-prompt-extract。完整流程：Playwright 渲染 → 网络拦截捕获 CDN 直链 → 下载 → ffmpeg 合成 → 音频转写 → 专有名词校正（疑词截帧验证）→ 分段输出。输出需发用户确认后才写入 Vault。
 metadata:
   requires:
     python_pkgs: ["playwright", "requests"]
@@ -14,18 +14,36 @@ metadata:
 抖音视频 → 口播逐字稿 → 结构化 Markdown。**单文件自包含**，`scripts/transcribe.py` 不依赖任何其他 Skill。
 
 > 2026-09-28 由 `douyin-ingest` + `douyin-transcribe-text` 合并而来。旧目录已归档为 `douyin-ingest.merged-away`，可回滚。
+>
+> **本 skill 是兄弟 skill 的公共库**：`xhs-transcribe-text` 复用这里的 `PROPER_NOUN_MAP`
+> （`scripts/transcribe.py`）、`references/proper-noun-map.md`、`references/output-format.md`；
+> `douyin-prompt-extract` 复用这里的下载器（`scripts/transcribe.py --download-only`）、
+> `scripts/ocr_vision.swift`、`references/frame-reading.md`。
+> 它们按 `<douyin-transcribe-text-skill-dir>/...` 路径引用 —— **这些文件不要改名或搬家**。
 
 ## 快速开始
 
-```bash
-T=~/.agents/skills/douyin-transcribe-text/scripts/transcribe.py
+本 skill 的脚本在 `scripts/` 下。下文的 `<douyin-transcribe-text-skill-dir>` 指本 skill 目录。
+**不要写死绝对路径** —— skill 会迁移/重装，写死的路径必然失效（实测 `~/.agents/skills/...` 已全部失效）。
+需要真实路径时：
 
-python3 $T "<抖音链接>"                    # 完整闭环
-python3 $T --video /path/to/local.mp4      # 已有本地视频，跳过下载
-python3 $T "<链接>" --check-link           # 只解析 video_id
-python3 $T "<链接>" --headful              # 首次登录验证用（见「安全边界」）
-python3 $T --video in.mp4 --frames 68,231,253,285   # 疑词截帧验证
+```bash
+find ~/.openclaw/agents ~/.agents/skills ~/.openclaw/skills \
+  -maxdepth 5 -type d -name douyin-transcribe-text 2>/dev/null | head -1
 ```
+
+```bash
+T="<douyin-transcribe-text-skill-dir>/scripts/transcribe.py"
+
+python3 $T "<抖音链接>"                # 完整闭环
+python3 $T --video /path/to/local.mp4  # 已有本地视频，跳过下载
+python3 $T "<链接>" --check-link       # 只解析 video_id
+python3 $T "<链接>" --headful          # 首次登录验证用（见「安全边界」）
+python3 $T "<链接>" --download-only    # 只下载视频，不转写（只要画面的场景）
+python3 $T --video in.mp4 --frames 68,231,253,285  # 按指定时间点抽帧（不校验文字）
+```
+
+疑词核验用 `scripts/verify_terms.py`（见「疑词截帧验证」），`--frames` 只是抽帧。
 
 ## 工作流
 
@@ -68,7 +86,7 @@ python3 $T --video in.mp4 --frames 68,231,253,285   # 疑词截帧验证
 
 **所以准确的说法是：**
 
-> 使用**独立的匿名浏览器 profile**（`~/Downloads/douyin_videos/.chrome_profile`），不接触用户日常浏览器的任何数据。抖音风控靠的是动态签名而非登录态，因此浏览器渲染是必要条件，这不等同于使用登录凭据。
+> 使用**独立的匿名浏览器 profile**（`~/.cache/openclaw/chrome_profiles/douyin`），不接触用户日常浏览器的任何数据。抖音风控靠的是动态签名而非登录态，因此浏览器渲染是必要条件，这不等同于使用登录凭据。
 
 **关于 `--headful`：** 抖音真要登录验证时，该参数打开**可见窗口，由用户本人手动登录**一次，会话存进同一个独立 profile 复用。属于本人可见操作，不是脚本偷取凭据。**必须在使用前向用户说明**，不得静默触发。
 
@@ -88,73 +106,46 @@ python3 $T --video in.mp4 --frames 68,231,253,285   # 疑词截帧验证
 | 硅基流动 key | `~/.agents/.siliconflow_key`（chmod 600）；也可用 `API_KEY` / `SILICONFLOW_API_KEY` 环境变量 |
 | 本地 Whisper（**backup**） | `~/.agents/venvs/whisper`（已装好，torch 2.14.0） |
 
-Key 读取优先级：环境变量 → `~/.agents/.siliconflow_key`。脚本内**不硬编码任何 key**。
+脚本内**不硬编码任何 key**。key 读取优先级、引擎选择与重建方式 → `references/transcription-engine.md`。
 
-## 转写引擎：快的默认，慢的 backup
+## 转写引擎：默认 SenseVoice，失败降级本地 Whisper
 
-M4 实测（同一段 60s 音频）：
+`transcribe()` 自己会选引擎，跑流程不用管。要点只有两条：
 
-| 引擎 | 耗时 | 角色 |
-|------|------|------|
-| SiliconFlow SenseVoiceSmall | **30.6s** | **默认** |
-| 本地 Whisper large-v3-turbo | 37.9s | backup（API 不可用时自动接管） |
+- **默认走硅基流动 SenseVoice**，API 不可用时自动降级本地 Whisper，流程不中断
+- **换引擎 = 整套专名校正层作废** —— `PROPER_NOUN_MAP` 是按 SenseVoice 的错误指纹逐条攒的
 
-**默认走 API 的原因：**
-- `FunAudioLLM/SenseVoiceSmall` 在硅基流动价格页标注**免费**（2026-08、2026-09 两次核实），不存在 API 成本
-- `PROPER_NOUN_MAP` 的 54 条规则是按 **SenseVoice 的错误指纹**逐条攒出来的，换引擎等于整套校正层作废、需重标定
-- 本地并不更快（37.9s vs 30.6s）
-
-**注意：Homebrew 装的 openai-whisper 不能用。** 它的 libtorch 硬链到特定版本 abseil，Homebrew 一升级就 `dlopen` 失败。脚本因此**优先用自建 venv**（`~/.agents/venvs/whisper`，PyPI 的 torch wheel，不受此影响）。
-
-重装 venv：
-```bash
-python3 -m venv ~/.agents/venvs/whisper
-~/.agents/venvs/whisper/bin/pip install openai-whisper
-```
-
-可覆盖：`DOUYIN_WHISPER_MODEL`（默认 `large-v3-turbo`）、`DOUYIN_WHISPER_LANGUAGE`（默认 `Chinese`）。
+引擎基准、API key 优先级、Whisper venv 重建（含「Homebrew 装的 openai-whisper 不能用」）→ `references/transcription-engine.md`。
 
 ## 专有名词校正
 
-`PROPER_NOUN_MAP` 按长度降序替换，纯本地无需网络。已验证条目（含依据）：
+`PROPER_NOUN_MAP` 按长度降序替换，纯本地无需网络，单次扫描不产生级联替换。
 
-| 听错词 | 正确写法 | 依据 |
-|--------|---------|------|
-| codeex | Codex | 上下文 |
-| GBT5.6 / GBT6 | GPT-5.6 / GPT-6 | 上下文 |
-| GPT6色 / GPT5.6艘 | gpt-6-sol | 上下文 |
-| GPT6ustra / GPT6Atra | gpt-6-astra | 上下文 |
-| GBT6luar / GPT6lu娜 | gpt-6-luna | 上下文 |
-| 子H / AIH / 主A卷 | 子 agent / agent / 主 agent | 上下文 |
-| scul / scu / ski | skill | 上下文 |
-| expllo / exQ / expl | Explore | 上下文 |
-| simplified | Simplify | 上下文 |
-| cloud / snet / oppos | Claude / Sonnet / Opus | 上下文 |
-| **experad** | **Expert Advisor** | ✅ 231s 烧录字幕角色列表 |
-| **劣制角色** | **内置角色** | ✅ 253s 烧录字幕 |
-| **outtra 模式** | **Ultra 模式** | ✅ 68s 烧录字幕 |
-| **febo** | **Fable** | ✅ 285s 烧录字幕 |
+**加词条、查已验证条目、看子串切分陷阱 → 读 `references/proper-noun-map.md`。**
+（那是词表维护的唯一权威说明，含恒等护栏机制、加词硬规矩、已验证条目表。）
 
-**新增词条必须走截帧验证，不能凭上下文猜。** 校正优先看**视频烧录字幕**（比用量表帧更直接），方法见 `--frames`。
+一条规则记住就够：**新增词条必须走截帧验证，不能凭上下文猜。**
 
 ## 疑词截帧验证（必跑，不可跳过）
 
 **交付前必须核实每一个疑词**，输出「已核实 / 仍未核实」两张表。只列「待确认」就交付 = 未完成。
 
-完整流程见 `references/frame-verification.md`。三条硬规则：
+| 文件 | 什么时候读 |
+|------|-----------|
+| `references/frame-verification.md` | 疑词核验**流程**（怎么跑、怎么定案、录屏类怎么读幻灯片） |
+| `references/frame-reading.md` | **读帧通用规矩**（串行、严格 OCR 提示、整帧 vs 字幕条、Vision OCR、帧拷进工作区）—— 所有读帧任务通用，读一次就够 |
 
-| 规则 | 说明 |
-|------|------|
-| **密集采样，不准单点抽帧** | 按 `字符位置/总长×时长` 估算误差实测达 **7s**（🎼音乐段+停顿打乱语速）。`verify_terms.py` 默认在估算点 **±12s、步长 2s** 抽帧 |
-| **禁用「画面里有什么」类提问** | VLM 实测会**编造画面不存在的内容**（把 `a16z` 凑成一篇《教父》影评）。必须用严格 OCR 提示：「只逐字抄录底部字幕，不要描述画面」 |
-| **字幕 + UI 双证据才算定案** | 单一来源不采信。屏幕录制类视频（横屏）**UI 文字是最强证据源**，优先读全帧而非只抠字幕条 |
+两条硬规则：**密集采样**（不准单点抽帧）+ **字幕与 UI 双证据才算定案**。
+两条的完整说明与实测依据 → 见 `references/frame-verification.md`。
 
 ```bash
-python3 ~/.agents/skills/douyin-transcribe-text/scripts/verify_terms.py \
+python3 "<douyin-transcribe-text-skill-dir>/scripts/verify_terms.py" \
   --video <mp4> --text <transcript_raw.md> --terms "词1,词2" --out <frames_dir>
 ```
 
-**为什么不能只靠上下文推断：** 2026-09-29 实测 7 个疑词里推断错 2 个（`n twogaM`→Notion 实为 **NotebookLM**；`重庆HD`→Claude HD 实为 **ChatGPT**），错误率 29%。这些词看起来全都"能从上下文推出来"，**自查发现不了**，只能靠画面定案。
+**为什么不能只靠上下文推断：** 实测上下文推断错误率 **29%**（逐条证据见
+`references/frame-verification.md`）。这些词看起来全都"能从上下文推出来"，
+**自查发现不了**，只能靠画面定案。
 
 ## 踩坑记录
 
@@ -163,100 +154,92 @@ python3 ~/.agents/skills/douyin-transcribe-text/scripts/verify_terms.py \
 3. **content-length 不可信** —— 抖音对部分流返回 0 或错误长度（实测声称 0.6MB 实收 7.6MB，偏差 12×）。脚本按 header 体积降序尝试，并**打印偏差警告**；首轮无合流时按实收体积重试一轮
 4. **CDN 签名有 10-30 分钟时效** —— 捕获后立即下载
 5. **yt-dlp 路径已死** —— 无 JS 引擎算签名，必然 403。代码中已全部移除，仅在文档注释里保留原因说明
-5. **CDN 返回音频替身** —— Douyin CDN 有时在 `/video/` 路径下返回纯音频流
-（Content-Type 报 video，但实际内容是 audio/aac），导致产出的 mp4 无视频轨、截帧验证全废。
-修复：在 download 后用 ffprobe probe 视频流，为空时自动 fallback 到 audio 直链下载。
-表现：`⚠️  CDN 直链只含音频流（无视频轨），尝试 audio 直链…`
+6. **CDN 返回音频替身** —— Douyin CDN 有时在 `/video/` 路径下返回纯音频流
+（Content-Type 报 video，但实际内容是 audio/aac）。
+   现状：脚本下载后用 ffprobe 判定每条流的真实构成（`_probe_streams`），
+   纯视频流 + 纯音频流会**合并**（`mux`）；若只剩音频流，产出的是无视频轨的 mp4，
+   转写照常但**截帧验证不可用**。
+   表现：`⚠️  本次未取到视频轨（抖音未下发），截帧验证不可用`
+7. **页面会预载并自动播放别的视频** —— 抖音单视频页里，推荐视频同样是「音视频合一」且体积最大，
+   按体积排序会**优先选中错的**（实测 2026-10-27：目标 114.218s，却下到另一条 107.8s 的配音视频）。
+   现状：脚本从页面 DOM 的 `<video>.duration` 取目标时长，**逐条候选流校验时长**（容差 3s）；
+   全部不符就**直接报错拒交**，不返回任何视频
+
+## 目录命名
+
+目录名用 `<主题>_<作者>_<日期>`，不用 video_id —— 让下载的对应文件夹一眼看出内容主题。
+video_id 记在目录内 `meta.json`，不丢可追溯性。
+
+**共享约定（媒体落盘位置、目录命名规则、批量重命名命令、exFAT 删文件坑）见
+README《媒体落盘位置》一节** —— 那是唯一权威处，抖音和小红书两边共用。
+本 skill 特有的只有元数据来源与页面身份校验：
+
+- 抖音页面 `description` 的格式是：
+  ```
+  <标题> - <作者>于20261025发布在抖音，已经收获了4008个喜欢，来抖音，记录美好生活！
+  ```
+  `og:title` 常为空（实测 15/15 全空），**必须从 description 解析**：
+  主题 / 作者 / 日期的解析规则实现在 `scripts/naming.py`
+  （`derive_title` / `extract_author` / `extract_date`）——
+  规则要改就改那里，**不要在别处再抄一份**（两处实现必然漂移）。
+
+  可覆盖：`--title` / `--author` / `--date`。Agent 读完稿子知道更准的主题时，显式传参覆盖。
+
+### ⚠️ 采信前必须校验页面身份
+
+抖音页面在并发 / 风控下可能渲染出**别的视频**（实测 2026-10-28：两个进程共用同一 profile 时，页面被渲染成另一条视频，导致目录名与下载内容完全对不上）。
+
+**判据**：`canonical` / `location` 必须仍指向目标 video_id（`og:url` 实测为空，不可用）。校验不过就**不采信任何 meta**，目录退回 video_id 并告警 —— 宁可名字难看，也不能名不副实。
+
+**页面标题同样不能采信**：身份校验失败时 `page_title` 属于被渲染出来的**另一个**视频。实测 2026-10-30：校验失败后 `meta.json` 写进了「天地之大 困住你的是什么」，而实际下载的是「给自己的网站下了一场大雨」。标题对不上比标题难看更糟 —— 它会让按标题检索的人找错文件。
 
 ## 输出格式
 
-见 `references/output-format.md`（frontmatter 字段表、分段规范、自检清单）。
+**交付形态（frontmatter 字段表、分段规范、飞书发送方式、自检清单、疑词处理决策表、
+写入 Vault 前的硬闸）全在 `references/output-format.md`** —— 那里是唯一权威处。
 
-### 飞书输出必须用 ```markdown 代码块（2026-09-29 用户明确要求）
+### 交付前跑质量闸（确定性规则，不靠模型自评）
 
-发给用户时，**整份文档包在 ```` ```markdown ```` 围栏里**，不要直接甩裸 markdown。
-
-原因：飞书对裸 markdown 的渲染会挤压长段落，密排成一坨，很难读（用户原话「一股脑把所有信息对在卡片消息上，很难看」）；代码块保证层级和断行原样显示。
-
-配套要求：
-
-| 做 | 不做 |
-|----|------|
-| 只发文档本身 | ❌ 在正文前后堆解释、对比表格、过程复盘 |
-| 用代码块包裹 | ❌ 裸发 markdown 让飞书渲染 |
-| 待确认词用文末 `⚠️` 一行 | ❌ 散落在正文里打断阅读 |
-| — | ❌ 用 `MEDIA:` 发 .md 文件（飞书会变成下载附件，用户看不到内容） |
-
-**注意围栏嵌套：** 文档内含 `---` 分隔线时，外层用**四个反引号** ```` ```` ```` 包裹，避免内部围栏提前闭合。
-
-已验证的反面案例（2026-09-29 踩过）：
-- 裸发 markdown → 用户嫌乱
-- 包三反引号但正文含 ``` → 提前闭合、渲染错乱
-- `MEDIA:` 发 .md → 变成附件下载，不是预览
-
-骨架：
-
-```markdown
----
-title: 文档标题
-description: 一句话描述（25字内）
-source: 原始来源链接
-tags: [标签1, 标签2]
-created: YYYY-MM-DD
-type: transcript
-confidence: medium
-speaker: 演讲者
----
-
-# 标题
-
-# 一、小标题
-
-正文...
-
----
-
-原始转发文本：...
+```bash
+python3 "<douyin-transcribe-text-skill-dir>/scripts/quality_gate.py" <transcript.md> --type speech
 ```
 
-`confidence` 未经逐段核对**不要填 high**。
+**类型必须选对**：口播稿用 `--type speech`；**画面实录/整理稿用 `--type note`** ——
+表格与加粗本身就是内容结构，按口播稿判会误报「markdown 残留」。
+结论里出现阻断项就改完再交付。
+
+**幻觉重复检测 + 质量闸的完整用法、标注格式、以及「标注不进 Vault」的边界
+→ 读 `references/delivery-gate.md`**（交付前检查阶段的唯一权威处）。
+
+### 要发视频文件（.mp4）时 → 读 `references/feishu-file-delivery.md`
+
+`MEDIA:` 指令发 .mp4 会被飞书拒收（实测落成 `msg_type=nonsupport`，或直接静默丢弃）。
+可用路线是 `im/v1/files` 上传 + `msg_type=file` 发送，脚本 `scripts/feishu_send_file.py` 已封装。
 
 ## 铁律
 
 1. **原文一字不改** —— 只做结构化分段，不增删改任何内容
 2. **未经确认不写 Vault** —— 「可以了」/「写入」才操作；数字、表情、简短肯定**不算确认**
-3. **视频保留本地** —— `~/Downloads/douyin_videos/<video_id>/`
-4. **存疑必标注** ⚠️ —— 无法核实的词保留原文并注明
+3. **视频保留本地** —— 落盘位置与目录命名见「目录命名」一节
+4. **存疑必标注** ⚠️ —— 无法核实的词保留原文并注明。标注只进交付对话，
+   **不进 Vault 正文**（硬闸见 `references/output-format.md`《写入 Vault 前的硬闸》）
 5. **来源不编造** —— 没有原始转发文本就注明未提供
 6. **疑词必核** —— 交付前跑 `verify_terms.py`，输出「已核实 / 仍未核实」两张表。只列待确认就交付 = 未完成
+7. **目录名必须名副其实** —— 目录名用 `<主题>_<作者>_<日期>`；页面身份校验不过就不采信 meta，目录退回 video_id
+8. **无口播不硬凑** —— 结果 `no_speech: true` 时不要把幻觉碎片当逐字稿交付，只交视频并说明
 
 ## 测试
 
 ```bash
-python3 -m pytest ~/.agents/skills/douyin-transcribe-text/tests/ -v
+python3 -m pytest "<douyin-transcribe-text-skill-dir>/tests/" -v
 ```
 
-覆盖：专有名词校正、疑词检测、错误分类、mp4 校验、密钥解析、结构化输出。
-
-## 幻觉重复检测
-
-`find_repeats()` 检测 ASR 复读/幻觉，**只标注不删改**（铁律「原文一字不改」）。
-
-阈值按单元长度自适应：
-
-| 单元长度 | 阈值 | 理由 |
-|---------|------|------|
-| ≤2 字符 | 5 次 | 「哈哈哈」「他他他」重复 3-4 次属正常，不报 |
-| ≥3 字符 | 3 次 | 长句复读 3 遍基本就是幻觉（实测 "I should keep on down" × 3） |
-
-字符类**排除句末标点**（。！？；：，、），避免跨句误配；上限 40 字符（「I should keep on down」长 21，设 20 会整条漏检）。
-
-标注格式：`〔⚠️ 疑似 ASR 幻觉重复 N 次，待确认〕`，插在重复段末尾，**文字原样保留**。
-`transcript_raw.md` 永远存未标注原文，判断权在用户。
+覆盖：专有名词校正、疑词检测、错误分类、mp4 校验、密钥解析、结构化输出、
+幻觉重复检测、流构成探测、字幕条几何、语速与无口播判定、标题解析。
 
 ## 已知局限
 
 - 超过 30 分钟的视频可能触及 API 大小限制，需分段转写
 - API 免费属当前策略，官方可随时调整；调整后 backup（本地 Whisper）自动接管，流程不中断
-- **ASR 识别上限**：SenseVoice 对专有名词、生僻字会出错（如「恩比德」→「恩彼得」），词表救不了。换引擎更糟——59 条词表全按 SenseVoice 错误指纹标定
+- **ASR 识别上限**：SenseVoice 对专有名词、生僻字会出错（如「恩比德」→「恩彼得」），词表救不了。换引擎更糟——整套词表都是按 SenseVoice 错误指纹标定的
 - **content-length 排序不可靠**：按 header 体积排序只是启发式，已加偏差警告 + 实收重试兜底，但极端情况下仍可能多下载几条流

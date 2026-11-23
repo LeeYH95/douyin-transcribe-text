@@ -6,7 +6,7 @@
 
 1. **字符位置换算时间轴不准**。实测同一条视频，按 pos/len*dur 估算抽 3 帧，
    有 2 帧落空（🎼 音乐段与停顿让语速不均匀，误差可达 ±7s）。
-   → 改为在估算点**密集采样**（默认 ±12s，步长 2s），宁可多抽也不漏。
+   → 改为在估算点**密集采样**（默认 ±12s，步长 1s），宁可多抽也不漏。
 
 2. **VLM 会编造**。实测对 215s 帧问"画面里有什么"，VLM 返回了一整篇
    《教父》电影分析 —— 画面里根本没有。必须用**严格 OCR 提示**
@@ -38,6 +38,10 @@ from pathlib import Path
 
 # 字幕条在画面底部的比例（竖屏 0.16-0.2，横屏黑条更矮）
 SUB_RATIO = 0.22
+# 字幕带额外向上延伸的安全边：避开底部常驻目录条 / 水印 / 进度条。
+# 必须按画面高度取比例，不能用固定像素 —— 固定 150px 在 240px 高的视频上
+# 占 62% 画高，字幕带退化成整帧（实测裁出 720x455），证据就不可读了。
+SUB_SAFE_RATIO = 0.08
 
 
 def probe_duration(video: Path) -> float:
@@ -98,15 +102,19 @@ def grab(video: Path, ts: float, out_dir: Path, slug: str,
         ["ffmpeg", "-v", "error", "-ss", str(ts), "-i", str(video),
          "-frames:v", "1", "-q:v", "2", str(full), "-y"],
         capture_output=True, check=True)
-    # 字幕条：底部 SUB_RATIO 高度，压到 720 宽便于 VLM 读清
+    # 字幕带：底部 SUB_RATIO 高度 + SUB_SAFE_RATIO 安全边。
+    # 安全边的作用是避开底部常驻目录条 —— 窄裁剪会只框到目录条，
+    # 每个时间点读数都一样（假证据）。
+    # 横向**不裁**：中文烧录字幕水平居中，裁左边会把字幕右半截切掉
+    # （实测 1280 宽视频上「就是把资料一股脑丢给AI」被裁成「就是把资料一股月」）。
+    # 整幅缩到 720 宽即可，竖屏 1080 宽也只缩不裁，不会丢字。
     ch = int(height * SUB_RATIO)
-    cw = min(width, 720)
-    cw -= cw % 2
-    ch -= ch % 2
+    safe = int(height * SUB_SAFE_RATIO)
+    band = ch + safe
     subprocess.run(
         ["ffmpeg", "-v", "error", "-ss", str(ts), "-i", str(video),
          "-frames:v", "1",
-         "-vf", f"crop={cw}:{ch}:0:{height - ch},scale=720:-1",
+         "-vf", f"crop={width}:{band}:0:{height - band},scale=720:-1",
          "-q:v", "2", str(sub), "-y"],
         capture_output=True, check=True)
     return [full, sub]
@@ -125,7 +133,7 @@ def main() -> int:
     ap.add_argument("--times", help="逗号分隔的秒数，跳过估算")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--window", type=int, default=12, help="估算点 ±N 秒")
-    ap.add_argument("--step", type=int, default=2, help="采样步长秒")
+    ap.add_argument("--step", type=int, default=1, help="采样步长秒")
     a = ap.parse_args()
 
     if not a.video.exists():
