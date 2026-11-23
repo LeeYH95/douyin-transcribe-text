@@ -7,7 +7,9 @@
 
 ## 1. 默认走 API，Whisper 是 backup
 
-`transcribe()` 的顺序：硅基流动 SenseVoice → 失败/限流自动降级本地 Whisper。
+`--engine auto` 的顺序为 SenseVoice → 本地 Whisper。缺凭证、云端失败、空结果或
+音频超过 50 MB 都会转入本地分支。`--engine whisper` 跳过上传，
+`--engine sensevoice` 将云端失败直接返回给调用方。
 
 M4 实测（同一段 60s 音频）：
 
@@ -21,11 +23,9 @@ M4 实测（同一段 60s 音频）：
 1. `FunAudioLLM/SenseVoiceSmall` 在硅基流动价格页标注**免费**（2026-08、2026-09 两次核实），不存在 API 成本
 2. 本地并不更快（37.9s vs 30.6s）
 
-> ⚠️ **换引擎 = 整套专名校正层作废。**
-> `PROPER_NOUN_MAP` 的每一条规则都是按 **SenseVoice 的错误指纹**逐条攒出来的，
-> 换引擎等于要重标定整张表（机制与加词规矩见 `proper-noun-map.md`）。
-
-**若官方把免费策略取消**：backup（本地 Whisper）自动接管，流程不中断。
+词表主要来自 SenseVoice 的历史误听。两条引擎路径都只生成候选，需要音频或画面证据才能应用。
+记录实际引擎及各段耗时到 `asr_engine` 和 `timings_seconds`。SenseVoice 当前接口只返回全文。
+Whisper 同一次识别保留分段时间戳，无需为抽帧重跑转写。
 
 ---
 

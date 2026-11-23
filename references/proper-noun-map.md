@@ -5,6 +5,10 @@
 > `xhs-transcribe-text` 复用同一张表（两端转写引擎都是 SenseVoiceSmall，错误指纹一致），
 > 所以**改词表 = 改这个文件描述的机制**，不是改小红书专属规则。
 
+抖音主流程通过 `propose_corrections()` 将命中项放入 JSON 的
+`correction_candidates`。草稿保留说话原词，核实后才应用修订。
+`correct_proper_nouns()` 保留给已有显式调用方。
+
 ---
 
 ## 1. 机制（不要改回别的实现）
@@ -57,8 +61,8 @@
 **验证方法**：拿 raw 跑一遍 `correct_proper_nouns()`，然后 grep 产物里有没有
 `skillll` / `skillskill` / `agentt` / `aagent` 这类**重复字** —— 有就是切坏了。
 
-**更稳的做法**：不要手改 .md，直接从 raw 用词表重建正文。这样「词表输出 == 正文」
-可复现，不会出现「词表改了但 .md 还是旧的」。
+保留 raw 和各次修订记录。从 raw 及已核实的修订重建正文。历史样本成立的组合，
+在新视频里仍需要对应证据，尤其是数字、金额和可能属于其他领域的真实词。
 
 ---
 

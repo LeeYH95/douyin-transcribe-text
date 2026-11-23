@@ -40,8 +40,8 @@
 
 | 规则 | 说明 |
 |------|------|
-| **密集采样，不准单点抽帧** | 按 `字符位置/总长×时长` 估算，误差实测达 **7s**（🎼音乐段+停顿打乱语速）。`verify_terms.py` 默认在估算点 **±12s、步长 1s** 抽帧 |
-| **字幕 + UI 双证据才算定案** | 单一来源不采信。屏幕录制类视频（横屏）**UI 文字是最强证据源**，优先读全帧而非只抠字幕条 |
+| **优先按 ASR 分段定位** | 检查该词出现的分段与前后边缘。有多个匹配段时保留各段。无分段时间戳或词未命中时，按字符位置估算，默认 **±12s、步长 1s** |
+| **核对同一时点的口播与画面** | 回听确认说的是哪一个词。用字幕、UI 或幻灯片确认拼写。画面里的词与该句口播无法对应时保持未核实 |
 
 「怎么读帧」的具体做法（禁问「画面里有什么」、严格 OCR 提示、串行、Vision OCR、路径白名单）
 → **`references/frame-reading.md`**
@@ -55,7 +55,7 @@ T="<douyin-transcribe-text-skill-dir>/scripts/verify_terms.py"
 D="<媒体根目录>/抖音/<主题>_<作者>_<日期>"
 
 python3 $T --video "$D/<video_id>.mp4" --text "$D/transcript_raw.md" \
-  --terms "申屠电网,n twogaM,重庆HD" \
+  --occurrences "25:28,71:74" \
   --out "$D/frames"
 ```
 
@@ -66,12 +66,14 @@ python3 $T --video "$D/<video_id>.mp4" --text "$D/transcript_raw.md" \
 | `--window` | 12 | 估算点 ±N 秒 |
 | `--step` | **1** | 采样步长秒；设为 2 会漏掉比 2 秒短的字幕（如片尾短句） |
 | `--times` | — | 直接给秒数，跳过估算（已知位置时用） |
+| `--segments` | 相邻 `transcript_segments.json` | 可显式指定转写分段时间戳 |
 
-每个词产出两份：
-- `词_秒.jpg` — 全帧，读 UI 用
-- `词_秒_sub.jpg` — 底部字幕条，读字幕用（需拷到工作区才能 `view_image`）
+从 `transcript_review.json` 选出现 ID。同一个词的不同位置分别定位。落在同一个 ASR
+分段内时，回听区分各次出现。
 
-产物同时写 `manifest.json`（疑词 → 帧列表）。
+每个时间点一次生成 `frame_秒.jpg` 和 `frame_秒_sub.jpg`。多个疑词共享同一时间点的
+全帧与字幕条。`manifest.json` 记录每处出现的帧、时点和 SHA-256。
+`--terms` 与 `--times` 适合探索画面。用于交付依据时使用出现 ID 生成绑定清单。
 
 ---
 

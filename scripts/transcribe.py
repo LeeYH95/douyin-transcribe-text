@@ -29,19 +29,24 @@ Pipeline（2026-09 实测验证）：
 import argparse
 import functools
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import urlsplit
 
 import requests
 
 # 目录命名模块（<主题>_<作者>_<日期>）—— 与本脚本同目录
 sys.path.insert(0, str(Path(__file__).parent))
 import naming  # noqa: E402
+from review import REVIEW_FILE, build_review  # noqa: E402
 
 # =============================================================================
 # 错误分类
@@ -138,6 +143,24 @@ def _load_api_key() -> str:
 
 
 API_KEY = _load_api_key()
+SILICONFLOW_MAX_AUDIO_BYTES = 50_000_000
+
+
+class ASRResult(NamedTuple):
+    text: str
+    engine: str
+    segments: list[dict]
+
+
+@contextmanager
+def measure_stage(timings: dict, stage: str):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = round(time.perf_counter() - started, 3)
+        timings[stage] = elapsed
+        print(f"[耗时] {stage}={elapsed:.3f}s", file=sys.stderr)
 
 
 # =============================================================================
@@ -224,6 +247,24 @@ def page_url(vid: str) -> str:
     return f"https://www.douyin.com/video/{vid}"
 
 
+def page_video_id(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not (
+            host == "douyin.com" or host.endswith(".douyin.com")):
+        return ""
+    match = re.fullmatch(r"/(?:video|note)/(\d+)/?", parsed.path)
+    return match[1] if match else ""
+
+
+def matches_page_identity(video_id: str, *urls: str) -> bool:
+    observed = {page_video_id(value) for value in urls} - {""}
+    return observed == {video_id}
+
+
 # =============================================================================
 # 2. Playwright 渲染 + 网络拦截
 # =============================================================================
@@ -303,8 +344,7 @@ def capture_stream_urls(video_id: str, profile_dir: Path,
         # 1. 页面 URL 里的 aweme_id 必须匹配目标 video_id
         current_url = page.url or ""
         import re
-        page_vid_match = re.search(r'/video/(\d+)', current_url)
-        page_vid = page_vid_match.group(1) if page_vid_match else ""
+        page_vid = page_video_id(current_url)
         if page_vid and page_vid != video_id:
             raise DouyinError(
                 f"[校验失败] 页面跳转了：目标 id={video_id}，实际 id={page_vid}\n"
@@ -312,7 +352,8 @@ def capture_stream_urls(video_id: str, profile_dir: Path,
                 f"  当前 URL: {current_url}"
             )
 
-        print(f"✅ 视频 id 校验通过 (id={video_id})", file=sys.stderr)
+        if page_vid == video_id:
+            print(f"✅ 视频 id 校验通过 (id={video_id})", file=sys.stderr)
 
         # ── 触发播放（仅在目标视频上操作，不会碰到推荐视频） ──────────────
         print("▶️  触发播放", file=sys.stderr)
@@ -326,8 +367,8 @@ def capture_stream_urls(video_id: str, profile_dir: Path,
                 continue
         try:
             page.evaluate(
-                "() => { document.querySelectorAll('video')"
-                ".forEach(v => { v.muted = true; v.play().catch(()=>{}); }); }")
+                "() => { const v = document.querySelector('video');"
+                " if (v) { v.muted = true; v.play().catch(()=>{}); } }")
         except Exception:
             pass
         try:
@@ -370,20 +411,26 @@ def capture_stream_urls(video_id: str, profile_dir: Path,
         except Exception:
             pass
 
-        # ── 采集目标视频时长（判别目标视频的唯一硬指标）────────────────
-        # 页面 DOM 里 <video>.duration 就是这条视频的真实时长。
-        # 抖音单视频页会预载并自动播放**其他**视频（推荐流 / 相邻作品），
-        # 那些流同样是「音视频合一」且体积最大——不拿时长校验就会静默下错文件
-        # （实测 2026-10-27：目标 114.218s，却下到另一条 PvZ 配音的 107.8s）。
-        # ⚠️ 不要用 <video> 的 src 做校验：抖音走 MSE 推流，currentSrc 正常
-        # 形态就是 blob:https://www.douyin.com/...（2026-10-01 已踩）。
+        # Gather evidence from one unambiguous player. Blob playback leaves
+        # the network candidates unbound, so the draft requires source review.
         target_duration = 0.0
+        player_source = ""
         try:
-            durs = page.evaluate(
-                "() => [...document.querySelectorAll('video')]"
-                ".map(v => v.duration || 0).filter(d => d > 0)")
-            if durs:
-                target_duration = float(max(durs))
+            player = page.evaluate(
+                """(id) => {
+                    const all = Array.from(document.querySelectorAll('video'));
+                    const bound = all.filter(v => v.closest(
+                        '[data-video-id="' + id + '"],[data-aweme-id="' + id + '"]'));
+                    const v = bound.length === 1 ? bound[0]
+                        : (all.length === 1 ? all[0] : null);
+                    return v ? {
+                        duration: Number.isFinite(v.duration) ? v.duration : 0,
+                        source: v.currentSrc || ''
+                    } : null;
+                }""", video_id)
+            if player:
+                target_duration = float(player["duration"])
+                player_source = player["source"]
         except Exception:
             pass
         if target_duration:
@@ -411,6 +458,7 @@ def capture_stream_urls(video_id: str, profile_dir: Path,
         "location": location,
         "needs_login": needs_login,
         "target_duration": target_duration,
+        "player_source": player_source,
     }
 
 
@@ -499,6 +547,8 @@ def transcribe_siliconflow(audio_path: Path) -> str:
     if not API_KEY:
         raise DouyinError("未设置 API_KEY 环境变量，"
                           "也未找到 ~/.agents/.siliconflow_key")
+    if audio_path.stat().st_size > SILICONFLOW_MAX_AUDIO_BYTES:
+        raise DouyinError("音频超过硅基流动单文件 50 MB 上限")
 
     with open(audio_path, 'rb') as f:
         files = {'file': ('audio.wav', f, 'audio/wav')}
@@ -570,7 +620,7 @@ def _whisper_environment() -> dict:
             compatible['DYLD_LIBRARY_PATH'] = (
                 str(library.parent) + (f':{previous}' if previous else ''))
             check = subprocess.run(
-                ['whisper', '--help'], capture_output=True, text=True, timeout=20,
+                [_whisper_bin(), '--help'], capture_output=True, text=True, timeout=20,
                 env=compatible,
             )
             if check.returncode == 0:
@@ -578,7 +628,7 @@ def _whisper_environment() -> dict:
     raise DouyinError("本地 Whisper 依赖损坏，请修复 PyTorch 与 Abseil 的版本匹配")
 
 
-def transcribe_whisper(audio_path: Path) -> str:
+def _transcribe_whisper_result(audio_path: Path) -> ASRResult:
     """降级方案：本地 Whisper 转写（M4 实测 60s 音频 ~35s）。
 
     默认 large-v3-turbo：比 small 快且专有名词更准（Codex / skill / agent
@@ -591,44 +641,73 @@ def transcribe_whisper(audio_path: Path) -> str:
         _whisper_bin(), str(audio_path),
         '--language', os.environ.get('DOUYIN_WHISPER_LANGUAGE', 'Chinese'),
         '--model', os.environ.get('DOUYIN_WHISPER_MODEL', 'large-v3-turbo'),
-        '--output_dir', str(output_dir), '--output_format', 'txt',
+        '--output_dir', str(output_dir), '--output_format', 'json',
         '--fp16', 'False',
     ]
 
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=1800,
-            env=_whisper_environment(),
         )
+        # 正常运行只启动一次 Whisper。兼容性探测仅用于已知的旧安装故障。
+        if (result.returncode != 0 and sys.platform == 'darwin'
+                and 'Library not loaded: /opt/homebrew/opt/abseil/' in result.stderr):
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=1800,
+                env=_whisper_environment(),
+            )
     except subprocess.TimeoutExpired as error:
         raise DouyinError("本地 Whisper 转写超时") from error
     if result.returncode != 0:
         raise DouyinError(f"本地 Whisper 转写失败（exit {result.returncode}）")
 
-    txt_file = output_dir / f"{audio_path.stem}.txt"
-    if not txt_file.exists():
-        raise DouyinError(f"Whisper 输出文件不存在: {txt_file}")
+    result_file = output_dir / f"{audio_path.stem}.json"
+    if not result_file.exists():
+        raise DouyinError(f"Whisper 输出文件不存在: {result_file}")
+    try:
+        payload = json.loads(result_file.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as error:
+        raise DouyinError("无法读取 Whisper 的分段输出") from error
+    segments = [
+        {"start": segment["start"], "end": segment["end"], "text": segment["text"]}
+        for segment in payload.get("segments", [])
+    ]
+    text = "\n".join(segment["text"].strip() for segment in segments).strip()
+    text = text or payload.get("text", "").strip()
+    (output_dir / f"{audio_path.stem}.txt").write_text(text + "\n", encoding="utf-8")
+    return ASRResult(text, "whisper", segments)
 
-    return txt_file.read_text(encoding='utf-8').strip()
+
+def transcribe_whisper(audio_path: Path) -> str:
+    return _transcribe_whisper_result(audio_path).text
 
 
 def transcribe(audio_path: Path) -> str:
-    """转写：先硅基流动，失败/限流自动降级到本地 Whisper"""
-    if API_KEY:
+    """兼容只需要逐字稿文本的调用方。"""
+    return transcribe_result(audio_path, "auto", {}).text
+
+
+def transcribe_result(audio_path: Path, engine: str, timings: dict) -> ASRResult:
+    if engine == "sensevoice" or (engine == "auto" and API_KEY):
         try:
             print("🎙️  尝试硅基流动 API...", file=sys.stderr)
-            text = transcribe_siliconflow(audio_path)
+            with measure_stage(timings, "sensevoice"):
+                text = transcribe_siliconflow(audio_path)
             if text.strip():
                 print("✅ 硅基流动转写成功", file=sys.stderr)
-                return text
+                return ASRResult(text, "sensevoice", [])
+            raise DouyinError("硅基流动返回空文本")
         except (DouyinError, requests.exceptions.RequestException, ValueError) as error:
+            if engine == "sensevoice":
+                raise DouyinError(f"仅使用 SenseVoice 转写失败：{error}") from error
             print(f"⚠️  云端转写不可用（{type(error).__name__}：{error}），"
                   "改用本地 Whisper", file=sys.stderr)
 
-    print("🔄 降级到本地 Whisper...", file=sys.stderr)
-    text = transcribe_whisper(audio_path)
+    print("🎙️  使用本地 Whisper...", file=sys.stderr)
+    with measure_stage(timings, "whisper"):
+        result = _transcribe_whisper_result(audio_path)
     print("✅ Whisper 转写成功", file=sys.stderr)
-    return text
+    return result
 
 
 # =============================================================================
@@ -824,6 +903,20 @@ def correct_proper_nouns(text: str) -> str:
     return _PROPER_NOUN_RE.sub(lambda m: PROPER_NOUN_MAP[m.group(0)], text)
 
 
+def propose_corrections(text: str) -> list[dict]:
+    """保留原词，词表仅提供复核候选和正文字符范围。"""
+    candidates = []
+    for match in _PROPER_NOUN_RE.finditer(text):
+        term = match.group(0)
+        suggestion = PROPER_NOUN_MAP[term]
+        if term != suggestion:
+            candidates.append({
+                "term": term, "suggestion": suggestion,
+                "start": match.start(), "end": match.end(),
+            })
+    return candidates
+
+
 def find_suspect_terms(text: str) -> list:
     """返回文本中仍可能存疑的专有名词候选（人工/多模态复核用）。"""
     suspects = []
@@ -953,18 +1046,18 @@ def format_output(text: str, *, title: str, source: str = "",
     if segmented:
         segmented = segmented.replace("\U0001f3bc", "")
 
-    lines = ["---", f"title: {title}"]
+    lines = ["---", f"title: {json.dumps(title, ensure_ascii=False)}"]
     if description:
-        lines.append(f"description: {description}")
+        lines.append(f"description: {json.dumps(description, ensure_ascii=False)}")
     if source:
-        lines.append(f"source: {source}")
-    lines.append(f"tags: [{', '.join(tags)}]")
+        lines.append(f"source: {json.dumps(source, ensure_ascii=False)}")
+    lines.append(f"tags: {json.dumps(tags, ensure_ascii=False)}")
     lines.append(f"created: {created}")
     lines.append("type: transcript")
     lines.append(f"confidence: {confidence}")
     if speaker:
-        lines.append(f"speaker: {speaker}")
-    lines.extend(["---", "", f"# {title}", "", segmented or text, ""])
+        lines.append(f"speaker: {json.dumps(speaker, ensure_ascii=False)}")
+    lines.extend(["---", "", f"# {' '.join(title.split())}", "", segmented or text, ""])
 
     if share_text:
         lines.extend(["---", "", "原始转发文本：", "", share_text, ""])
@@ -978,34 +1071,33 @@ def format_output(text: str, *, title: str, source: str = "",
 # 8. 完整流程
 # =============================================================================
 
+def _probe_media(path: Path) -> tuple[bool, bool, float]:
+    """一次 ffprobe 取得真实音视频轨和容器时长。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type:format=duration", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=20, check=True)
+        data = json.loads(r.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False, False, 0.0
+    stream_types = {stream.get("codec_type") for stream in data.get("streams", [])}
+    duration = data.get("format", {}).get("duration")
+    try:
+        seconds = float(duration or 0)
+    except (ValueError, TypeError):
+        seconds = 0.0
+    return "video" in stream_types, "audio" in stream_types, seconds if math.isfinite(seconds) else 0.0
+
+
 def _probe_streams(path: Path) -> tuple[bool, bool]:
-    """用 ffprobe 判定文件的真实流构成，返回 (有视频流, 有音频流)。"""
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=20)
-        out = r.stdout or ""
-        return ("video" in out, "audio" in out)
-    except Exception:
-        return (False, False)
-
-
-def _probe_duration(path: Path) -> float:
-    """用 ffprobe 取文件时长（秒）；失败返回 0.0。"""
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=20)
-        return float((r.stdout or "0").strip() or 0)
-    except Exception:
-        return 0.0
+    return _probe_media(path)[:2]
 
 
 def _fetch_stream(candidates: list[tuple[str, int]], dest_dir: Path,
                   referer: str,
-                  target_duration: float | None = None
+                  target_duration: float | None = None,
+                  accepted_urls: dict | None = None,
                   ) -> tuple[Path, Path | None, bool]:
     """按体积降序试候选 CDN 流。
 
@@ -1021,24 +1113,12 @@ def _fetch_stream(candidates: list[tuple[str, int]], dest_dir: Path,
     抖音页面会预载并自动播放**其他**视频（如推荐流），这些流同样是
     "音视频合一"且体积最大——不校验时长就会被静默当成目标下载
     （实测 2026-10-27：目标 114.218s，却下到另一条 PvZ 配音的 107.8s）。
-    时长是判别目标视频的唯一硬指标，必须校验。
+    时长用于筛掉明显不符的候选，长度相同的候选仍需结合来源判断。
     """
     TOLERANCE = 3.0  # 秒
     audio_fallback: Path | None = None
     video_only: Path | None = None
-    mismatch: list[Path] = []   # 时长不符的流（页面预载的其他视频）
-    # （候选, 已下载文件 or None, 实际体积, 声称体积）
-    tried: list[tuple[tuple[str, int], Path | None, int, int]] = []
-
-    def _probe_all() -> tuple[Path, Path | None, bool] | None:
-        """按已下载文件重排再试一轮（应对 content-length 谎报）。"""
-        have = sorted((t for t in tried if t[1] is not None),
-                      key=lambda t: t[2], reverse=True)
-        for cand, path, actual, _hinted in have:
-            has_v, has_a = _probe_streams(path)
-            if has_v and has_a:
-                return path, None, True
-        return None
+    rejected_duration = 0
 
     for i, (url, hinted) in enumerate(candidates, 1):
         ext = "m4a" if "/tos-cn-ve-" in url else "mp4"
@@ -1050,23 +1130,22 @@ def _fetch_stream(candidates: list[tuple[str, int]], dest_dir: Path,
         except Exception as e:
             print(f"   ⚠️  跳过：{e}", file=sys.stderr)
             dest.unlink(missing_ok=True)
-            tried.append(((url, hinted), None, 0, hinted))
             continue
 
         actual = path.stat().st_size
-        has_v, has_a = _probe_streams(path)
-        dur = _probe_duration(path)
+        has_v, has_a, dur = _probe_media(path)
         print(f"   → 实收 {actual/1e6:.1f}MB"
               f"  视频轨={has_v}  音频轨={has_a}"
               f"  时长={dur:.3f}s", file=sys.stderr)
-        tried.append(((url, hinted), path, actual, hinted))
-
         # ── 时长校验：挡掉页面预载的其他视频 ──────────────────────────
-        if target_duration and dur and abs(dur - target_duration) > TOLERANCE:
+        if target_duration and (dur <= 0 or abs(dur - target_duration) > TOLERANCE):
             print(f"   ⚠️  时长不符：目标 {target_duration:.3f}s 实收 {dur:.3f}s"
                   f" → 判定为页面预载的其他视频，跳过", file=sys.stderr)
-            mismatch.append(path)
+            rejected_duration += 1
             continue
+
+        if accepted_urls is not None:
+            accepted_urls[path] = url
 
         # 可观测性：header 声称与实收偏差超过 3 倍 → 警告
         # （实测 2026-09-29：抖音对部分流返回 0 或错误 content-length）
@@ -1082,27 +1161,15 @@ def _fetch_stream(candidates: list[tuple[str, int]], dest_dir: Path,
         elif has_a and audio_fallback is None:
             audio_fallback = path
 
-    # 第一轮没找到合流 → 按实收体积重排再试一轮
-    retry = _probe_all()
-    if retry is not None:
-        print("🔁 首轮未找到合流，按实收体积重试后命中合流", file=sys.stderr)
-        return retry
-
-    # 全部候选都时长不符 → 绝不能默默交出一个错视频
-    if mismatch and not target_duration:
-        print(f"   ⚠️  有 {len(mismatch)} 条流但无法核对时长"
-              f"（页面未给出 duration），按原逻辑继续", file=sys.stderr)
-    elif mismatch:
-        raise DouyinError(
-            f"所有 CDN 候选流时长均与目标不符（目标 {target_duration:.3f}s）。"
-            f"抖音页面预载了其他视频，已拒绝交付错误内容。"
-            f"请重试，或用 --headful 观察页面实际播放内容。")
-
     if video_only is not None:
         return video_only, audio_fallback, True
     if audio_fallback is not None:
         return audio_fallback, None, False
-    raise DouyinError("所有 CDN 候选流均下载或解析失败")
+    if rejected_duration:
+        raise DouyinLinkInvalidError(
+            f"未找到符合目标时长 {target_duration:.3f}s 的有效媒体流；"
+            "请检查目标页面或使用已确认来源的本地文件。")
+    raise DouyinLinkInvalidError("所有 CDN 候选流均下载或解析失败")
 
 
 def find_repeats(text: str, min_times: int | None = None) -> list[dict]:
@@ -1167,24 +1234,28 @@ def transcribe_douyin(link: str,
                       description: str = "",
                       author: str = "",
                       pub_date: str = "",
-                      download_only: bool = False) -> dict:
+                      download_only: bool = False,
+                      engine: str = "auto") -> dict:
     """主流程（链接入口）：解析 → 下载 → 合成 → 转写 → 校正 → 目录命名。
 
     download_only=True 时只下载视频、不转写 —— 提示词提取等场景只要画面，
     不需要音频，省掉一次 ASR 调用。
     """
-    video_id = resolve_video_id(link)
+    timings = {}
+    with measure_stage(timings, "resolve_link"):
+        video_id = resolve_video_id(link)
 
     print(f"🔖 video_id: {video_id}", file=sys.stderr)
 
-    cap = capture_stream_urls(video_id, profile_dir, headful=headful)
+    with measure_stage(timings, "capture_streams"):
+        cap = capture_stream_urls(video_id, profile_dir, headful=headful)
 
     if cap.get("needs_login"):
-        raise DouyinError("页面要求登录验证。请用 --headful 在可见窗口手动登录一次，"
+        raise DouyinLinkInvalidError("页面要求登录验证。请用 --headful 在可见窗口手动登录一次，"
                           "会话存进独立 profile 目录复用。")
 
     if not cap["video"]:
-        raise DouyinError(
+        raise DouyinLinkInvalidError(
             f"未捕获到 CDN 媒体流。video={len(cap['video'])} "
             f"audio={len(cap['audio'])} other={len(cap['other'])}")
 
@@ -1198,7 +1269,7 @@ def transcribe_douyin(link: str,
     # 判据：canonical / location 必须仍指向目标 video_id。
     canonical = cap.get("canonical", "") or ""
     location = cap.get("location", "") or ""
-    page_identity_ok = (video_id in canonical) or (video_id in location)
+    page_identity_ok = matches_page_identity(video_id, canonical, location)
 
     desc = cap.get("desc", "") or ""
     og_title = cap.get("og_title", "") or ""
@@ -1232,14 +1303,27 @@ def transcribe_douyin(link: str,
             continue
         seen.add(u)
         ordered.append((u, sizes.get(u, 0)))
-    ordered.sort(key=lambda x: x[1], reverse=True)
+    player_source = cap.get("player_source", "")
+    ordered.sort(key=lambda x: (x[0] == player_source, x[1]), reverse=True)
 
-    main_path, extra_audio, video_only = _fetch_stream(
-        ordered, dest_dir, page_url(video_id),
-        target_duration=cap.get("target_duration") or None)
+    accepted_urls = {}
+    with measure_stage(timings, "download_and_probe"):
+        main_path, extra_audio, video_only = _fetch_stream(
+            ordered, dest_dir, page_url(video_id),
+            target_duration=cap.get("target_duration") or None,
+            accepted_urls=accepted_urls)
+    linked = bool(page_identity_ok and player_source and video_only
+                  and accepted_urls.get(main_path) == player_source and extra_audio is None)
+    source_record = {
+        "value": page_url(video_id), "video_id": video_id,
+        "verification": "linked_media" if linked else "needs_confirmation",
+        "page_identity_matches": page_identity_ok,
+        "player_duration_seconds": cap.get("target_duration") or None,
+    }
 
     print("🔧 合成 mp4", file=sys.stderr)
-    mux(main_path, extra_audio, final_mp4)
+    with measure_stage(timings, "mux"):
+        mux(main_path, extra_audio, final_mp4)
     if not keep_streams:
         main_path.unlink(missing_ok=True)
         if extra_audio:
@@ -1272,6 +1356,8 @@ def transcribe_douyin(link: str,
             "output_dir": str(dest_dir),
             "folder": dest_dir.name,
             "download_only": True,
+            "source_verification": source_record["verification"],
+            "timings_seconds": timings,
         }
         result["output_dir"] = str(dest_dir)
         result["folder"] = dest_dir.name
@@ -1281,7 +1367,9 @@ def transcribe_douyin(link: str,
                               video_id=video_id, title=final_title,
                               keep_audio=keep_audio,
                               description=description,
-                              dest_dir=dest_dir)
+                              dest_dir=dest_dir, engine=engine,
+                              source_record=source_record)
+    result["timings_seconds"] = {**timings, **result["timings_seconds"]}
 
     # 目录内写 meta.json：记 video_id / 主题 / 作者 / 日期 / 来源
     try:
@@ -1303,20 +1391,24 @@ def transcribe_local(video_path: Path,
                      keep_audio: bool = False,
                      description: str = "",
                      source: str = "",
-                     dest_dir: Path | None = None) -> dict:
+                     dest_dir: Path | None = None,
+                     engine: str = "auto",
+                     source_record: dict | None = None) -> dict:
     """转写本地 MP4（不经过下载）。链接流程和 --video 入口共用此后半段。
 
     dest_dir: 显式指定输出目录（下载流程已按主题命名好时传入）。
     """
     video_path = Path(video_path).resolve()
     if not _validate_mp4(video_path):
-        raise DouyinError("本地文件不是有效 MP4，或文件尚未下载完整")
+        raise DouyinLinkInvalidError("本地文件不是有效 MP4，或文件尚未下载完整")
 
     # _validate_mp4 只查 ftyp magic + 体积，纯音频 m4a 也能通过。
     # 这里补一次真实流校验：--video 入口直接给音频文件时会被拦下。
-    has_video, has_audio = _probe_streams(video_path)
+    timings = {}
+    with measure_stage(timings, "probe_media"):
+        has_video, has_audio, audio_seconds = _probe_media(video_path)
     if not has_audio:
-        raise DouyinError("输入文件不含音频轨，无法转写")
+        raise DouyinLinkInvalidError("输入文件不含音频轨，无法转写")
     if not has_video:
         print("⚠️  输入文件无视频轨（纯音频），--frames 截帧验证不可用",
               file=sys.stderr)
@@ -1327,6 +1419,10 @@ def transcribe_local(video_path: Path,
         identity = f'{video_path}:{video_path.stat().st_size}:{video_path.stat().st_mtime_ns}'
         video_id = f'local-{stem}-{hashlib.sha256(identity.encode()).hexdigest()[:8]}'
     title = title or video_path.stem
+    source_record = source_record or {
+        "value": source or str(video_path), "video_id": video_id,
+        "verification": "needs_confirmation" if source and source != str(video_path) else "local_file",
+    }
 
     dest_dir = dest_dir or (output_dir / video_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1334,18 +1430,20 @@ def transcribe_local(video_path: Path,
     print("🎙️  提取音频 + 转写", file=sys.stderr)
     audio_path = dest_dir / "audio.wav"
     if not audio_path.exists():
-        extract_audio(video_path, audio_path)
-    raw_text = transcribe(audio_path)
+        with measure_stage(timings, "extract_audio"):
+            extract_audio(video_path, audio_path)
+    asr = transcribe_result(audio_path, engine, timings)
+    raw_text = asr.text
     if not raw_text.strip():
         raise DouyinError("转写结果为空，请检查视频是否包含清晰口播")
-    (dest_dir / "transcript_raw.md").write_text(raw_text, encoding="utf-8")
+    raw_path = dest_dir / "transcript_raw.md"
+    raw_path.write_text(raw_text, encoding="utf-8")
 
     # SenseVoice 非语音音频标记（背景音乐/BGM）→ 直接删，不进知识库
     # transcript_raw.md 保留纯净原文；清理只发生在 corrected 及之后的链路
     raw_text = raw_text.replace("\U0001f3bc", "")  # 🎼 U+1F3BC
 
     # ── 无口播判定：纯 BGM 视频的 ASR 输出是幻觉碎片，不是口播稿 ──────
-    audio_seconds = _probe_duration(video_path)
     eff_chars, rate, no_speech = speech_rate(raw_text, audio_seconds)
     if no_speech:
         print(f"⚠️  本片疑似无口播：有效字符 {eff_chars} 个 / {audio_seconds:.0f}s "
@@ -1354,15 +1452,27 @@ def transcribe_local(video_path: Path,
               "不要把这份幻觉碎片当逐字稿交付。",
               file=sys.stderr)
 
-    corrected = correct_proper_nouns(raw_text)
-    suspects = find_suspect_terms(corrected)
-    repeats = find_repeats(corrected)
+    candidates = propose_corrections(raw_text)
+    suspects = find_suspect_terms(raw_text)
+    occurrences = candidates.copy()
+    for suspect in suspects:
+        for match in re.finditer(re.escape(suspect["term"]), raw_text):
+            if not any(item["start"] < match.end() and match.start() < item["end"]
+                       for item in occurrences):
+                occurrences.append({**suspect, "start": match.start(), "end": match.end()})
+    flagged_terms = {suspect["term"] for suspect in suspects}
+    for candidate in candidates:
+        term = candidate["term"]
+        if term not in flagged_terms:
+            suspects.append({"term": term, "type": "词表候选"})
+            flagged_terms.add(term)
+    repeats = find_repeats(raw_text)
     if repeats:
         print(f"⚠️  检测到 {len(repeats)} 处疑似 ASR 幻觉重复（已标注，文字未改）:",
               file=sys.stderr)
         for r in repeats:
             print(f"   · {r['times']}×「{r['unit']}」", file=sys.stderr)
-    display = annotate_repeats(corrected, repeats)
+    display = annotate_repeats(raw_text, repeats)
 
     if not description:
         print("⚠️  description 未提供：schema 标为必填字段，本次输出将缺失该字段。"
@@ -1372,12 +1482,23 @@ def transcribe_local(video_path: Path,
         display, title=title,
         # 优先用显式传入的 source；否则本地文件路径猜不出抖音 id，
         # 只能对数字 id（真实 aweme_id）反推页面链接。
-        source=source or (page_url(video_id) if str(video_id).isdigit() else ""),
+        source=source_record["value"],
         description=description,
         confidence="medium",
     )
     md_path = dest_dir / "transcript.md"
     md_path.write_text(markdown, encoding="utf-8")
+    segments_path = dest_dir / "transcript_segments.json"
+    segments_path.write_text(json.dumps({
+        "engine": asr.engine, "segments": asr.segments,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    review_path = dest_dir / REVIEW_FILE
+    review = build_review(raw_path, video_path, source_record, asr.segments,
+                          occurrences, audio_seconds, no_speech)
+    review_path.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+    status = "no_speech" if no_speech else (
+        "needs_source_confirmation" if source_record["verification"] == "needs_confirmation"
+        else "needs_review")
 
     # audio.wav 是纯中间产物：16kHz 单声道 WAV 无压缩，体积比 mp4 还大，
     # 转写完就没用了，需要时从 mp4 重抽只要 ~1 秒。默认转写成功后删除。
@@ -1391,12 +1512,20 @@ def transcribe_local(video_path: Path,
 
     return {
         "ok": True,
+        "status": status,
+        "review_path": str(review_path),
+        "source_verification": source_record["verification"],
         "video_id": video_id,
         "title": title,
         "raw_text": raw_text,  # 已清 🎼；transcript_raw.md 写在此之前，保留原样
-        "corrected_text": corrected,
+        "corrected_text": raw_text,  # 兼容字段；复核前保留原词
         "display_text": display,  # 已清除 🎼
         "suspect_terms": suspects,
+        "correction_candidates": candidates,
+        "asr_engine": asr.engine,
+        "segments": asr.segments,
+        "segments_path": str(segments_path),
+        "timings_seconds": timings,
         "repeats": repeats,
         "no_speech": no_speech,       # True = 疑似无口播，别当逐字稿交付
         "speech_rate": rate,          # 有效字符/秒
@@ -1441,6 +1570,8 @@ def main():
     ap.add_argument("--speaker", default="", help="演讲者/作者")
     ap.add_argument("--source", default="", help="原始来源链接")
     ap.add_argument("--description", default="", help="description（不填则留空，由 Agent 确认时填入）")
+    ap.add_argument("--engine", choices=["auto", "sensevoice", "whisper"], default="auto",
+                    help="auto 优先云端；whisper 仅本地；sensevoice 仅云端")
     ap.add_argument("--author", default="", help="作者名（不填则自动从页面 description 提取）")
     ap.add_argument("--date", default="", help="发布日期 YYYYMMDD（不填则自动从页面提取）")
     args = ap.parse_args()
@@ -1469,7 +1600,8 @@ def main():
                 args.video, output_dir=Path(args.output), title=args.title,
                 keep_audio=args.keep_audio,
                 description=args.description,
-                source=args.source)
+                source=args.source,
+                engine=args.engine)
         else:
             result = transcribe_douyin(
                 args.link,
@@ -1483,12 +1615,15 @@ def main():
                 author=args.author,
                 pub_date=args.date,
                 download_only=args.download_only,
+                engine=args.engine,
             )
 
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     except DouyinError as e:
         print(f"❌ {type(e).__name__}: {e}", file=sys.stderr)
+        status = "needs_media" if isinstance(e, DouyinLinkInvalidError) else "failed"
+        print(json.dumps({"ok": False, "status": status, "error": str(e)}, ensure_ascii=False))
         sys.exit(2)
 
 

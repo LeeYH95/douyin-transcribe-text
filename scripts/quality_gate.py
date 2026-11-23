@@ -13,6 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from review import REVIEW_FILE, evaluate_review, nonblank, normalized_body
+
+local_dependencies = Path(__file__).resolve().parents[1] / ".python-deps"
+if local_dependencies.is_dir():
+    sys.path.append(str(local_dependencies))
+
 # ── 书面语特征词（出现在口播稿里 = 翻译腔/AI味）────────────────────
 WRITTEN_MARKERS = [
     "因此", "从而", "综上", "此外", "然而", "首先", "其次", "最后",
@@ -31,19 +37,58 @@ SENT_SPLIT = re.compile(r"[。！？!?；;]+")
 
 def load_body(path: Path) -> tuple[str, str]:
     """返回 (正文, frontmatter)。剔除校正说明表——它不是要发的内容。"""
-    raw = path.read_text(encoding="utf-8", errors="ignore")
+    raw = path.read_text(encoding="utf-8")
     fm = ""
-    if raw.startswith("---"):
-        parts = raw.split("---", 2)
-        if len(parts) == 3:
-            fm, raw = parts[1], parts[2]
+    header = re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", raw, re.S)
+    if header:
+        fm, raw = header[1], raw[header.end():]
+    raw = re.split(r"(?m)^---[ \t]*\n\s*原始转发文本(?:未提供|[：:])", raw, maxsplit=1)[0]
     # 去掉一级标题行
     body = "\n".join(l for l in raw.split("\n") if not l.startswith("# "))
-    # 去掉专名校正说明段
-    idx = body.find("## 专有名词校正说明")
-    if idx > 0:
-        body = body[:idx]
     return body.strip(), fm.strip()
+
+
+def inspect_frontmatter(text: str) -> dict:
+    from datetime import date
+
+    fields = {}
+    error = ""
+    try:
+        import yaml
+        fields = yaml.safe_load(text)
+        if not isinstance(fields, dict):
+            fields = {}
+            error = "需要 YAML 属性表"
+    except ImportError:
+        error = "请安装 PyYAML 以验证文档属性"
+    except (yaml.YAMLError, ValueError, TypeError):
+        error = "YAML 属性格式无效"
+
+    required = ("title", "description", "source", "tags", "created", "type", "confidence")
+    missing = [key for key in required if key not in fields]
+    invalid = []
+    for key in required:
+        if key in missing:
+            continue
+        value = fields[key]
+        valid = nonblank(value)
+        if key == "tags":
+            valid = isinstance(value, list) and bool(value) and all(map(nonblank, value))
+        if key == "created":
+            try:
+                date.fromisoformat(str(value))
+                valid = True
+            except ValueError:
+                valid = False
+        if key == "confidence":
+            valid = isinstance(value, str) and value in {"high", "medium", "low"}
+        if not valid:
+            invalid.append(key)
+    return {
+        "字段": list(fields), "缺失必填": missing, "无效字段": invalid, "错误": error,
+        "合规": not (missing or invalid or error),
+        "source": fields.get("source"), "type": fields.get("type"),
+    }
 
 
 def split_sentences(body: str) -> list[str]:
@@ -88,11 +133,6 @@ def analyze(path: Path) -> dict:
     # 4. markdown 残留
     md_leak = re.findall(r"\*\*[^*\n]{2,50}\*\*|^\s*[-*]\s+|`[^`\n]+`", body, re.M)
 
-    # 5. frontmatter 字段完整性
-    fm_keys = [l.split(":")[0] for l in fm.split("\n") if ":" in l]
-    required = ["title", "description", "source", "tags", "created", "type", "confidence"]
-    fm_missing = [k for k in required if k not in fm_keys]
-
     return {
         "文件": str(path),
         "正文字数": nchars,
@@ -117,11 +157,7 @@ def analyze(path: Path) -> dict:
             "英文词样本": sorted(set(en_tokens))[:10],
         },
         "格式残留": {"markdown符号": len(md_leak)},
-        "frontmatter": {
-            "字段": fm_keys,
-            "缺失必填": fm_missing,
-            "合规": not fm_missing,
-        },
+        "frontmatter": inspect_frontmatter(fm),
         "_sents": sents,
         "_body": body,
     }
@@ -169,15 +205,8 @@ def shutil_which(cmd: str) -> str | None:
 
 
 def judge(r: dict, tts: dict, note_type: str = "speech") -> list[str]:
-    """给出可执行的结论（不是打分，是「能不能发」的判断）
-
-    note_type="speech"：口播稿，markdown 符号/括号是残留，要拦。
-    note_type="note"：画面实录/整理稿，表格与加粗本身就是内容结构，
-                     不可朗读性检查不适用（这类稿子本来就没口播）。
-    """
+    """提供可读性提示。交付状态由证据、原稿与属性校验决定。"""
     issues = []
-    if r["frontmatter"]["缺失必填"]:
-        issues.append(f"frontmatter 缺必填字段: {r['frontmatter']['缺失必填']}")
     if r["书面语"]["每百字密度"] > 1.5:
         issues.append(f"书面语密度 {r['书面语']['每百字密度']}/百字偏高，像 AI 写的稿子")
     if r["句长"]["长句占比%"] > 25:
@@ -193,43 +222,102 @@ def judge(r: dict, tts: dict, note_type: str = "speech") -> list[str]:
             issues.append(f"语速 {v} 字/秒 偏快（正常口播 4.5-6），听感会赶")
         elif v < 3.2:
             issues.append(f"语速 {v} 字/秒 偏慢")
-    if not issues:
-        issues.append("✅ 无阻断项，可直接发")
     return issues
+
+
+def check_delivery(path: Path, report: dict, body: str, note_type: str) -> dict:
+    meta = report["frontmatter"]
+    blockers = []
+    if meta["错误"]:
+        blockers.append(meta["错误"])
+    if meta["缺失必填"]:
+        blockers.append(f"缺少笔记属性：{', '.join(meta['缺失必填'])}")
+    if meta["无效字段"]:
+        blockers.append(f"无效笔记属性：{', '.join(meta['无效字段'])}")
+
+    status = "ready"
+    if note_type == "speech" or meta["type"] == "transcript" or (path.parent / REVIEW_FILE).exists():
+        review = evaluate_review(path.parent)
+        status = review["status"]
+        blockers.extend(review["blockers"])
+        if status == "ready":
+            if meta["type"] != "transcript":
+                blockers.append("逐字稿的 type 必须是 transcript")
+            if meta["source"] != review["source"]:
+                blockers.append("稿件来源与核验记录不一致")
+            if normalized_body(body) != normalized_body(review["body"]):
+                blockers.append("正文含未核验的修改或遗漏")
+    if not body.strip():
+        blockers.append("正文为空")
+    if status == "ready" and blockers:
+        status = "needs_review"
+    return {"status": status, "blockers": blockers}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+")
-    ap.add_argument("--out", default="/tmp/qg_out")
+    ap.add_argument("--out", type=Path, help="试听音频目录")
     ap.add_argument("--voice", default=None)
+    ap.add_argument("--tts", action="store_true", help="额外生成可读性试听音频")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--render-reviewed", action="store_true", help="仅输出核验通过的精确正文")
     ap.add_argument("--type", choices=["speech", "note"], default="speech",
                     help="speech=口播稿（可朗读性检查生效）；note=画面实录/整理稿"
                          "（表格加粗即内容，跳过朗读类检查）")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.render_reviewed:
+        if len(args.files) != 1 or args.json or args.tts or args.voice:
+            ap.error("--render-reviewed 只接受一个文档，单独使用")
+        review = evaluate_review(Path(args.files[0]).parent)
+        if review["status"] != "ready":
+            print(json.dumps({"status": review["status"], "blockers": review["blockers"]},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        print(review["body"])
+        return 0
+
+    wants_tts = args.tts or bool(args.voice)
+    if wants_tts and not args.out:
+        ap.error("生成试听音频需要显式指定 --out")
+    if wants_tts:
+        args.out.mkdir(parents=True, exist_ok=True)
 
     all_r = []
     for f in args.files:
         p = Path(f)
-        r = analyze(p)
-        tts = tts_probe(r.pop("_body"), out_dir, args.voice)
+        try:
+            r = analyze(p)
+        except (OSError, UnicodeError) as exc:
+            r = {"文件": str(p), "status": "needs_review",
+                 "blockers": [f"无法读取稿件：{exc}"]}
+            all_r.append(r)
+            continue
+        body = r.pop("_body")
+        r.update(check_delivery(p, r, body, args.type))
+        tts = tts_probe(body, args.out, args.voice) if wants_tts else {
+            "可用": False, "原因": "未启用试听",
+        }
         r["TTS"] = tts
         r["结论"] = judge(r, tts, note_type=args.type)
         r.pop("_sents", None)
         all_r.append(r)
 
+    exit_code = 0 if all(r["status"] == "ready" for r in all_r) else 2
     if args.json:
         print(json.dumps(all_r, ensure_ascii=False, indent=2))
-        return
+        return exit_code
 
     for r in all_r:
         print("=" * 66)
         print(f"📄 {Path(r['文件']).name}")
         print("=" * 66)
+        if "TTS" not in r:
+            print(f"  交付状态    : {r['status']}")
+            for blocker in r["blockers"]:
+                print(f"    · {blocker}")
+            continue
         print(f"  正文 {r['正文字数']} 字 / {r['句数']} 句"
               f"  [{args.type} 稿]")
         w = r["书面语"]
@@ -246,8 +334,9 @@ def main():
         if p["英文词样本"]:
             print(f"    英文词   : {', '.join(p['英文词样本'])}")
         print(f"  格式残留   : markdown {r['格式残留']['markdown符号']} 处")
-        fm = r["frontmatter"]
-        print(f"  frontmatter: {'✅ 合规' if fm['合规'] else '❌ 缺 ' + str(fm['缺失必填'])}")
+        print(f"  交付状态    : {r['status']}")
+        for blocker in r["blockers"]:
+            print(f"    · {blocker}")
         t = r["TTS"]
         if t.get("可用"):
             print(f"  TTS 实测   : {t['音色']} | {t['时长秒']}s | "
@@ -255,11 +344,12 @@ def main():
             print(f"    试听文件 : {t['音频']}")
         else:
             print(f"  TTS 实测   : 不可用（{t.get('原因')}）")
-        print("  ── 判定 ──")
+        print("  ── 提示 ──")
         for c in r["结论"]:
             print(f"    · {c}")
         print()
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

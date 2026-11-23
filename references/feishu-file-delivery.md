@@ -28,8 +28,9 @@ python3 scripts/feishu_send_file.py --chat-id oc_xxx --file a.mp4 --file b.mp4
 = `im/v1/files`（`file_type=stream`）上传拿 `file_key` → `im/v1/messages` 以
 `msg_type=file` 发送。飞书客户端可下载/播放。
 
-可选参数：`--caption "说明"`（先发一条文字说明）、`--dry-run`（只打印动作不真发）、
-`--account knowledge-master`（换飞书账号）。
+可用 `--caption "说明"` 先发一条文字说明，用 `--account` 选择已配置账号。
+发送前需要用户授权。当前脚本的 `--dry-run` 仍会获取令牌，带 `--caption` 时还会发送文字。
+本地预览可核对文件及说明内容，避免执行发送脚本。
 
 **不要走** `im/v1/media`（原生视频气泡）：该端点对本应用返回 **404**，走不通。
 

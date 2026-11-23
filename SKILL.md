@@ -3,7 +3,7 @@ name: douyin-transcribe-text
 description: 抖音视频 → 口播逐字稿 → Obsidian 结构化笔记。当用户发来抖音链接或本地 MP4，需要口播逐字稿、专有名词校正、疑词核实、分段整理，或需要把视频文件交付飞书时使用。只做口播逐字稿；画面里的 AI 生图提示词走 douyin-prompt-extract。完整流程：Playwright 渲染 → 网络拦截捕获 CDN 直链 → 下载 → ffmpeg 合成 → 音频转写 → 专有名词校正（疑词截帧验证）→ 分段输出。输出需发用户确认后才写入 Vault。
 metadata:
   requires:
-    python_pkgs: ["playwright", "requests"]
+    python_pkgs: ["playwright", "requests", "PyYAML"]
     system_bins: ["ffmpeg", "ffprobe"]
     optional_bins: ["~/.agents/venvs/whisper/bin/whisper"]
     key_file: "~/.agents/.siliconflow_key"
@@ -11,7 +11,7 @@ metadata:
 
 # douyin-transcribe-text
 
-抖音视频 → 口播逐字稿 → 结构化 Markdown。**单文件自包含**，`scripts/transcribe.py` 不依赖任何其他 Skill。
+抖音视频 → 口播逐字稿 → 结构化 Markdown。`scripts/transcribe.py` 和同目录模块不依赖其他 Skill。
 
 > 2026-09-28 由 `douyin-ingest` + `douyin-transcribe-text` 合并而来。旧目录已归档为 `douyin-ingest.merged-away`，可回滚。
 >
@@ -62,11 +62,11 @@ python3 $T --video in.mp4 --frames 68,231,253,285  # 按指定时间点抽帧（
                     │
                     ▼  （此后 A/B 合流）
   extract_audio()               ffmpeg 提取 16kHz mono WAV
-  transcribe()                  硅基流动 SenseVoice（失败降级本地 Whisper）
-  correct_proper_nouns()        已知专有名词批量替换（纯本地）
-  find_suspect_terms()          标记仍存疑的词
-  verify_terms.py               疑词截帧验证（必跑，见 references/frame-verification.md）
-  format_output()               YAML frontmatter + 一级标题分段
+  transcribe_result()           SenseVoice 或本地 Whisper，记录引擎与阶段耗时
+  propose_corrections()         词表只提名疑词，原词保留
+  find_suspect_terms()          补充启发式疑词
+  verify_terms.py               按出现 ID 截帧，记录可核查的证据
+  quality_gate.py               核对来源、原稿、证据与最终 Markdown
                     │
                     ▼
   发用户确认 ──「可以了」/「写入」──▶ 写入 04_inbox/openclaw-agent/
@@ -103,6 +103,7 @@ python3 $T --video in.mp4 --frames 68,231,253,285  # 按指定时间点抽帧（
 | playwright | `python3 -m pip install playwright --break-system-packages` |
 | chromium | `python3 -m playwright install chromium` |
 | ffmpeg / ffprobe | `brew install ffmpeg` |
+| PyYAML | `python3 -m pip install PyYAML`（交付检查） |
 | 硅基流动 key | `~/.agents/.siliconflow_key`（chmod 600）；也可用 `API_KEY` / `SILICONFLOW_API_KEY` 环境变量 |
 | 本地 Whisper（**backup**） | `~/.agents/venvs/whisper`（已装好，torch 2.14.0） |
 
@@ -112,14 +113,15 @@ python3 $T --video in.mp4 --frames 68,231,253,285  # 按指定时间点抽帧（
 
 `transcribe()` 自己会选引擎，跑流程不用管。要点只有两条：
 
-- **默认走硅基流动 SenseVoice**，API 不可用时自动降级本地 Whisper，流程不中断
-- **换引擎 = 整套专名校正层作废** —— `PROPER_NOUN_MAP` 是按 SenseVoice 的错误指纹逐条攒的
+- `--engine auto` 优先 SenseVoice，缺凭证、超限或云端出错时尝试本地 Whisper。需要限定引擎时使用 `--engine whisper` 或 `--engine sensevoice`。
+- 遇到任务慢，先看输出中的 `timings_seconds` 或 stderr 的 `[耗时]`，定位是浏览器取源、下载、云端等待还是本地识别。
 
 引擎基准、API key 优先级、Whisper venv 重建（含「Homebrew 装的 openai-whisper 不能用」）→ `references/transcription-engine.md`。
 
 ## 专有名词校正
 
-`PROPER_NOUN_MAP` 按长度降序替换，纯本地无需网络，单次扫描不产生级联替换。
+`PROPER_NOUN_MAP` 按长度降序匹配，命中项输出到 `correction_candidates`。
+`transcript.md` 保留原词。结合原音及同一时点的字幕、UI 或幻灯片核实后再改稿，并记录原词、改词、时点和证据。
 
 **加词条、查已验证条目、看子串切分陷阱 → 读 `references/proper-noun-map.md`。**
 （那是词表维护的唯一权威说明，含恒等护栏机制、加词硬规矩、已验证条目表。）
@@ -128,19 +130,21 @@ python3 $T --video in.mp4 --frames 68,231,253,285  # 按指定时间点抽帧（
 
 ## 疑词截帧验证（必跑，不可跳过）
 
-**交付前必须核实每一个疑词**，输出「已核实 / 仍未核实」两张表。只列「待确认」就交付 = 未完成。
+从 `transcript_review.json` 读取疑词的出现 ID。逐处回听或对照帧，记录在
+`review_decisions.json`。输出「已核实 / 仍未核实」两张表。待核验的草稿标明状态。
 
 | 文件 | 什么时候读 |
 |------|-----------|
 | `references/frame-verification.md` | 疑词核验**流程**（怎么跑、怎么定案、录屏类怎么读幻灯片） |
 | `references/frame-reading.md` | **读帧通用规矩**（串行、严格 OCR 提示、整帧 vs 字幕条、Vision OCR、帧拷进工作区）—— 所有读帧任务通用，读一次就够 |
 
-两条硬规则：**密集采样**（不准单点抽帧）+ **字幕与 UI 双证据才算定案**。
+- 优先按相邻的 `transcript_segments.json` 定位。云端 TXT、旧稿或疑词未命中分段时，仍用估算窗密集采样。
+- 回听确定说了什么。字幕、UI 或幻灯片确认拼写，证据须与该次口播对应。无法确认时保留原词。
 两条的完整说明与实测依据 → 见 `references/frame-verification.md`。
 
 ```bash
 python3 "<douyin-transcribe-text-skill-dir>/scripts/verify_terms.py" \
-  --video <mp4> --text <transcript_raw.md> --terms "词1,词2" --out <frames_dir>
+  --video <mp4> --text <transcript_raw.md> --occurrences "25:28,71:74" --out <frames_dir>
 ```
 
 **为什么不能只靠上下文推断：** 实测上下文推断错误率 **29%**（逐条证据见
@@ -151,7 +155,7 @@ python3 "<douyin-transcribe-text-skill-dir>/scripts/verify_terms.py" \
 
 1. **抖音不自动播放** —— 必须 `play()` / 空格键触发，否则拦截到 0 条流
 2. **音/视频/合流三条流，content-type 全是 `video/mp4`** —— 抖音把音频也装在 MP4 容器里，**靠 content-type 区分音视频无效**（实测 2026-09-29 三条流 ct 完全相同）。必须下载后用 ffprobe 判定真实流构成
-3. **content-length 不可信** —— 抖音对部分流返回 0 或错误长度（实测声称 0.6MB 实收 7.6MB，偏差 12×）。脚本按 header 体积降序尝试，并**打印偏差警告**；首轮无合流时按实收体积重试一轮
+3. **content-length 不可信** —— 脚本按 header 体积降序尝试，并打印偏差警告。单次 ffprobe 取得音视频轨与时长，已排除的候选不会重试。
 4. **CDN 签名有 10-30 分钟时效** —— 捕获后立即下载
 5. **yt-dlp 路径已死** —— 无 JS 引擎算签名，必然 403。代码中已全部移除，仅在文档注释里保留原因说明
 6. **CDN 返回音频替身** —— Douyin CDN 有时在 `/video/` 路径下返回纯音频流
@@ -201,12 +205,13 @@ README《媒体落盘位置》一节** —— 那是唯一权威处，抖音和�
 ### 交付前跑质量闸（确定性规则，不靠模型自评）
 
 ```bash
-python3 "<douyin-transcribe-text-skill-dir>/scripts/quality_gate.py" <transcript.md> --type speech
+python3 "<douyin-transcribe-text-skill-dir>/scripts/quality_gate.py" <transcript.md> --type speech --json
 ```
 
 **类型必须选对**：口播稿用 `--type speech`；**画面实录/整理稿用 `--type note`** ——
 表格与加粗本身就是内容结构，按口播稿判会误报「markdown 残留」。
-结论里出现阻断项就改完再交付。
+`ok: true` 仅表示处理完成。先用质量闸检查，并且只有 `status=ready` 才交付终稿。
+页面与媒体无法直接关联时先核实来源。Vault 写入仍需用户明确确认。
 
 **幻觉重复检测 + 质量闸的完整用法、标注格式、以及「标注不进 Vault」的边界
 → 读 `references/delivery-gate.md`**（交付前检查阶段的唯一权威处）。
@@ -239,7 +244,6 @@ python3 -m pytest "<douyin-transcribe-text-skill-dir>/tests/" -v
 
 ## 已知局限
 
-- 超过 30 分钟的视频可能触及 API 大小限制，需分段转写
-- API 免费属当前策略，官方可随时调整；调整后 backup（本地 Whisper）自动接管，流程不中断
-- **ASR 识别上限**：SenseVoice 对专有名词、生僻字会出错（如「恩比德」→「恩彼得」），词表救不了。换引擎更糟——整套词表都是按 SenseVoice 错误指纹标定的
-- **content-length 排序不可靠**：按 header 体积排序只是启发式，已加偏差警告 + 实收重试兜底，但极端情况下仍可能多下载几条流
+- 16 kHz 单声道 PCM 音频约 26 分钟就可能到达 50 MB 上传上限。`auto` 超限时尝试本地 Whisper。
+- **ASR 识别上限**：专名和生僻字需要复核。云端只有全文时，疑词时间点仍靠估算。
+- **content-length 排序不可靠**：按 header 体积排序可能多下载几条流。抓取和下载耗时以实际日志为准。

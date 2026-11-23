@@ -85,8 +85,11 @@
 |------|------|
 | `transcript_raw.md` | 未经专有名词校正的原始转写；Agent 用来核对校正效果，不直接展示给用户 |
 | `audio.wav` | 16kHz 单声道中间音频；转写成功后默认删除，`--keep-audio` 保留 |
-| `whisper_out/` | Whisper 原始 JSON 分段输出；本地 Whisper 降级路径的原始产物 |
-| `frames/` | 专有名词疑词截帧；仅在 `--frames` 参数触发时生成 |
+| `transcript_segments.json` | 引擎与分段时间戳。纯文本引擎的分段数组为空 |
+| `transcript_review.json` | 原稿和媒体 SHA-256、来源、每一处疑词及其时间范围 |
+| `review_decisions.json` | 核验后按出现 ID 记录保留或修订以及证据 |
+| `whisper_out/` | Whisper 原始 JSON 与纯文本输出 |
+| `frames/` | 主脚本 `--frames` 或疑词核验脚本产出的证据帧 |
 
 所有产物统一在**本次下载的目录**里（目录名规则见 README《媒体落盘位置》——
 `<主题>_<作者>_<日期>`），不污染 `current/` 等共享路径。
@@ -142,7 +145,7 @@ speaker: [演讲者]
 
 ## 写入 Vault 前的硬闸（2026-10-01 明确要求）
 
-**存在未核实词汇时，禁止写入 Vault。** 必须先向用户逐条确认，用户确认后才可写入。
+**仅在质量闸返回 `ready` 且用户明确确认写入时归档。** 存在未核实词汇时先向用户逐条确认。
 
 | 情形 | 处理 |
 |---|---|

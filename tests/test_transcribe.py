@@ -10,12 +10,12 @@ douyin-transcribe-text 单元测试。
 """
 
 import importlib.util
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -388,19 +388,19 @@ class TestHallucinationDetection:
 # 流构成探测（ffprobe 封装）
 # =============================================================================
 
-FIXTURE_AUDIO = Path("/tmp/test_audio_only.m4a")
-FIXTURE_VIDEO = Path("/tmp/test_video_only.mp4")
-FIXTURE_COMBO = Path("/tmp/test_combined.mp4")
+FIXTURE_AUDIO: Path
+FIXTURE_VIDEO: Path
+FIXTURE_COMBO: Path
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _media_fixtures():
+def _media_fixtures(tmp_path_factory):
     """现场生成三个媒体样本（纯音频 / 纯视频 / 音视频合一）。
 
     以前靠 /tmp 里预先存在的副本，换台机器就整组测试失效。
     这里用 ffmpeg 现场生成：离线、可复现。
     """
-    d = Path(tempfile.mkdtemp(prefix="dy_fixtures_"))
+    d = tmp_path_factory.mktemp("dy_fixtures")
     audio, video, combo = (d / "audio_only.m4a", d / "video_only.mp4",
                            d / "combined.mp4")
 
@@ -469,44 +469,65 @@ class TestFetchStream:
     """_fetch_stream(candidates) 按体积降序试流、probe 真实构成。"""
 
     @mock.patch.object(t, "download", side_effect=_mock_download)
-    def test_合一流直接返回(self, _mock):
+    def test_合一流直接返回(self, _mock, tmp_path):
         # 候选只有合一流 → 第一条命中，返回 (path, None, True)
         cands = [("http://example.com/combo_fixture", 1000)]
-        main, extra, has_v = t._fetch_stream(cands, Path("/tmp"), "http://ref")
+        main, extra, has_v = t._fetch_stream(cands, tmp_path, "http://ref")
         assert has_v is True
         assert extra is None
         # main 应该是合并后的文件（就是 fixture）
         assert main.exists()
 
     @mock.patch.object(t, "download", side_effect=_mock_download)
-    def test_纯视频加纯音频_合并返回(self, _mock):
+    def test_纯视频加纯音频_合并返回(self, _mock, tmp_path):
         # 候选：视频(大) + 音频(小) → 先拿视频，再拿音频合并
         # 为简化：按标记返回对应 fixture；_probe_streams 读取真实文件
         cands = [
             ("http://example.com/video_fixture", 9000),
             ("http://example.com/audio_fixture", 1000),
         ]
-        main, extra, has_v = t._fetch_stream(cands, Path("/tmp"), "http://ref")
+        main, extra, has_v = t._fetch_stream(cands, tmp_path, "http://ref")
         assert has_v is True
         assert extra is not None  # 有额外音频待合并
         assert main.exists()
 
     @mock.patch.object(t, "download", side_effect=_mock_download)
-    def test_只有纯音频_退化为音频流(self, _mock):
+    def test_只有纯音频_退化为音频流(self, _mock, tmp_path):
         cands = [("http://example.com/audio_fixture", 5000)]
-        main, extra, has_v = t._fetch_stream(cands, Path("/tmp"), "http://ref")
+        main, extra, has_v = t._fetch_stream(cands, tmp_path, "http://ref")
         assert has_v is False
         assert extra is None
         assert main.exists()
 
     @mock.patch.object(t, "download", side_effect=_mock_download)
-    def test_所有流下载失败_抛异常(self, _mock):
+    def test_所有流下载失败_抛异常(self, _mock, tmp_path):
         def _fail(url, dest, ref):
             raise t.DouyinError("download fail")
         with mock.patch.object(t, "download", side_effect=_fail):
             cands = [("http://example.com/fail_fixture", 1000)]
             with pytest.raises(t.DouyinError, match="所有 CDN 候选流均下载或解析失败"):
-                t._fetch_stream(cands, Path("/tmp"), "http://ref")
+                t._fetch_stream(cands, tmp_path, "http://ref")
+
+    @mock.patch.object(t, "download", side_effect=_mock_download)
+    def test_时长不符的合流不会被重新选中(self, _mock, tmp_path):
+        with pytest.raises(t.DouyinError, match="符合目标时长"):
+            t._fetch_stream(
+                [("https://example.com/combo_fixture", 1000)], tmp_path,
+                "https://example.com", target_duration=10.0,
+            )
+
+    @mock.patch.object(t, "download", side_effect=_mock_download)
+    def test_排除错误合流后仍然接受有效分流(self, _mock, tmp_path):
+        candidates = [(f"https://example.com/{kind}_fixture", 1000)
+                      for kind in ("combo", "video", "audio")]
+        with mock.patch.object(t, "_probe_media", side_effect=[
+            (True, True, 107.8), (True, False, 114.2), (False, True, 114.2),
+        ]) as probe:
+            video, audio, has_video = t._fetch_stream(
+                candidates, tmp_path, "https://example.com", target_duration=114.218,
+            )
+        assert (video.name, audio.name, has_video) == ("cand2.mp4", "cand3.mp4", True)
+        assert probe.call_count == 3
 
 
 # =============================================================================
@@ -550,6 +571,13 @@ class TestVerifyTermsMapping:
         plan = vt.estimate_times(["不存在的词"], self.TEXT, 100.0, window=2, step=2)
         assert len(plan["不存在的词"]) >= 1
 
+    def test_分段时间戳覆盖疑词的多次出现(self):
+        segments = [{"start": 8.2, "end": 9.1, "text": "第一个目标疑词"},
+                    {"start": 30.6, "end": 32.0, "text": "再次目标疑词"}]
+        assert vt.segment_times("目标疑词", segments, 45, 1) == [
+            7, 8, 9, 10, 11, 29, 30, 31, 32, 33,
+        ]
+
     def test_slugify_保留中文(self):
         assert vt.slugify("申屠电网") == "申屠电网"
 
@@ -590,6 +618,25 @@ class TestVerifyTermsFFmpeg:
         assert sub.name == "测试_1_sub.jpg"
         assert full.stat().st_size > 0 and sub.stat().st_size > 0
 
+    def test_两个疑词共享同一时间点的帧(self, video, tmp_path, monkeypatch):
+        raw = tmp_path / "transcript_raw.md"
+        raw.write_text("同一段 NotebookLM 和 Codex", encoding="utf-8")
+        raw.with_name("transcript_segments.json").write_text(
+            '{"segments":[{"start":0.5,"end":1.5,"text":"同一段 NotebookLM 和 Codex"}]}',
+            encoding="utf-8",
+        )
+        out = tmp_path / "frames"
+        monkeypatch.setattr(sys, "argv", [
+            "verify_terms.py", "--video", str(video), "--text", str(raw),
+            "--terms", "NotebookLM,Codex", "--out", str(out),
+        ])
+        assert vt.main() == 0
+        terms = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["terms"]
+        assert terms["NotebookLM"]["method"] == "asr_segments"
+        assert terms["NotebookLM"]["frames"] == terms["Codex"]["frames"]
+        assert len(list(out.glob("*.jpg"))) == len(terms["NotebookLM"]["frames"])
+
+
     def test_字幕条为底部裁剪(self, video, tmp_path):
         """字幕条是「宽而扁」的横带，不是全帧。
 
@@ -610,6 +657,47 @@ class TestVerifyTermsFFmpeg:
         w, h = vt.probe_size(video)
         assert 2.5 < dur < 3.5
         assert (w, h) == (320, 240)
+
+
+def test_正常Whisper只启动一次且原文保留正确术语(tmp_path, monkeypatch):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(FIXTURE_COMBO.read_bytes())
+    monkeypatch.setattr(t, "API_KEY", "offline-test-key")
+    monkeypatch.setattr(t, "extract_audio", lambda _, audio: audio.write_bytes(b"test"))
+    calls = []
+    monkeypatch.setattr(t, "_probe_media", lambda _: (True, True, 12.0))
+    monkeypatch.setattr(t, "_whisper_bin", lambda: "whisper")
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        output_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        (output_dir / "audio.json").write_text(
+            '{"text":"IPS面板", "segments":[{"start":0.0,"end":1.0,"text":"IPS面板"}]}',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(t.subprocess, "run", run)
+    result = t.transcribe_local(video, output_dir=tmp_path, engine="whisper")
+    assert len(calls) == 1
+    assert "--help" not in calls[0]
+    assert result["asr_engine"] == "whisper"
+    assert result["segments"] == [{"start": 0.0, "end": 1.0, "text": "IPS面板"}]
+    assert "IPS面板" in Path(result["markdown_path"]).read_text(encoding="utf-8")
+    assert result["correction_candidates"][0]["suggestion"] == "FPS"
+
+
+def test_云端超限跳过上传并转本地(monkeypatch):
+    audio = mock.Mock(spec=Path)
+    audio.stat.return_value.st_size = t.SILICONFLOW_MAX_AUDIO_BYTES + 1
+    monkeypatch.setattr(t, "API_KEY", "offline-test-key")
+    monkeypatch.setattr(t, "_transcribe_whisper_result",
+                        lambda _: t.ASRResult("录音稿", "whisper", []))
+    timings = {}
+    with mock.patch.object(t.requests, "post") as post:
+        assert t.transcribe_result(audio, "auto", timings).engine == "whisper"
+        post.assert_not_called()
+    assert timings.keys() == {"sensevoice", "whisper"}
 
 
 # =============================================================================

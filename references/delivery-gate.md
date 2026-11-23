@@ -7,7 +7,7 @@
 交付前要跑的两件事，都是**确定性规则，不靠模型自评**：
 
 1. **幻觉重复检测** —— ASR 复读 / 幻觉，脚本已自动标注，你只需判断标注是否合理
-2. **质量闸 `quality_gate.py`** —— 书面语密度、句长、朗读干扰、frontmatter 完整性
+2. **质量闸 `quality_gate.py`** —— 确认原稿、媒体、逐处证据和最终稿相符
 
 ---
 
@@ -37,20 +37,44 @@
 ## 2. 质量闸
 
 ```bash
-python3 "<douyin-transcribe-text-skill-dir>/scripts/quality_gate.py" <transcript.md> --type speech
+python3 "<douyin-transcribe-text-skill-dir>/scripts/quality_gate.py" <transcript.md> --type speech --json
 ```
 
-**类型必须选对**：
+口播任务的入口状态为 `needs_review`、`needs_source_confirmation` 或 `no_speech`。
+取不到媒体时入口返回 `needs_media`。质量闸检查通过后才返回 `ready`。
+任何阻断项都会给出 JSON 的 `blockers`，退出码为 2。
+句长、书面词和朗读性只给提示。需要试听时显式提供 `--tts --out <音频输出目录>`。
 
-| `--type` | 适用 | 差异 |
-|---|---|---|
-| `speech`（默认） | 口播逐字稿 | markdown 符号 / 括号插入语算残留，要拦 |
-| `note` | 画面实录 / 整理稿 | 表格与加粗本身就是内容结构，不判 markdown 残留，朗读类检查不适用 |
+### 记录核验决定
 
-判定项：frontmatter 必填字段、书面语密度（>1.5/百字）、长句占比（>25%）、
-括号插入语、破折号、英文词、TTS 实测语速（>7 或 <3.2 字/秒偏快偏慢）。
+将下列格式保存为稿件旁的 `review_decisions.json`。指纹和出现 ID 从
+`transcript_review.json` 复制。每一处出现都要分别查证。`keep` 保留，`replace` 指定修订词。
 
-结论里出现阻断项就改完再交付。
+```json
+{
+  "raw_sha256": "<原稿 SHA-256>",
+  "media_sha256": "<媒体 SHA-256>",
+  "occurrences": {
+    "25:28": {
+      "action": "keep",
+      "evidence": {"kind": "audio", "seconds": 3.5, "reason": "回听确认这里说的是 IPS"}
+    },
+    "71:74": {
+      "action": "replace",
+      "replacement": "FPS",
+      "evidence": {"kind": "frame", "seconds": 31, "manifest": "frames/manifest.json", "reason": "这一处口播与画面计数器一致"}
+    }
+  }
+}
+```
+
+当来源待确认时，核对具体媒体与原作品后，额外记录
+`"source_confirmation": {"source": "<核验记录中的来源>", "reason": "<对应依据>"}`。
+对分离流或 MSE，作品页与时长匹配只能作为线索。源文件、原稿或抽帧清单不一致会阻断。
+
+用 `quality_gate.py <transcript.md> --render-reviewed` 获取按出现位置应用修订的正文，
+添加分段标题并保存后，再对最终 Markdown 执行 `--json` 检查。
+核验决定必须来自实际回听或查看帧。程序检查记录和文件的一致性。
 
 ---
 
